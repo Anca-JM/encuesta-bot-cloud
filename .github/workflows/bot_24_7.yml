@@ -1,0 +1,32 @@
+name: Asistente Encuesta 24-7 en Tiempo Real
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
+
+concurrency:
+  group: encuesta-bot-24-7
+  cancel-in-progress: false
+
+jobs:
+  listen-and-reply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run 24/7 Real-Time Listener
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: python cloud_encuesta_bot.py
