@@ -35,6 +35,7 @@ seen_ntfy_ids = set()
 last_update_id = 0
 custom_context = ""
 toggle_idx = 0
+last_sent_msg_id = None  # Almacena el ID del ultimo mensaje enviado para borrarlo al llegar el nuevo
 
 CODE_WORDS = {
     "A": ["Árbol", "Ámbar"],
@@ -49,11 +50,11 @@ CODE_WORDS = {
 
 SYSTEM_PROMPT = (
     "Analiza la pregunta PRINCIPAL de la imagen (ignora miniaturas o barras del navegador).\n"
-    "Razona en máximo 12 palabras cuál es la respuesta exacta descartando trampas y cierra OBLIGATORIAMENTE con <R>VALOR</R>:\n"
-    "1. Si es VERDADERO o FALSO: <R>V</R> o <R>F</R>.\n"
-    "2. Si es SÍ o NO: <R>S</R> o <R>N</R>.\n"
-    "3. Si es OPCIÓN MÚLTIPLE (A, B, C, D o de arriba a abajo 1=A, 2=B, 3=C, 4=D): <R>A</R>, <R>B</R>, <R>C</R> o <R>D</R>.\n"
-    "4. Si es OTRO TIPO: escribe dentro de <R>...</R> SOLO la primera palabra de la respuesta correcta (ej: <R>El</R>)."
+    "En máximo 8 palabras identifica el concepto exacto descartando trampas y cierra con <R>VALOR</R>:\n"
+    "1. VERDADERO/FALSO: <R>V</R> o <R>F</R>.\n"
+    "2. SÍ/NO: <R>S</R> o <R>N</R>.\n"
+    "3. OPCIÓN MÚLTIPLE (A, B, C, D o de arriba a abajo 1=A, 2=B, 3=C, 4=D): <R>A</R>, <R>B</R>, <R>C</R> o <R>D</R>.\n"
+    "4. OTRO TIPO: escribe dentro de <R>...</R> SOLO la primera palabra de la opción correcta (ej: <R>El</R>)."
 )
 
 
@@ -74,11 +75,11 @@ def prepare_image_smart_crop(image_bytes: bytes):
                 img = img.crop((left, top, right, bottom))
 
         w, h = img.size
-        if max(w, h) > 768:
-            scale = 768.0 / max(w, h)
+        if max(w, h) > 720:
+            scale = 720.0 / max(w, h)
             img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.BILINEAR)
         out = io.BytesIO()
-        img.save(out, format="JPEG", quality=80, optimize=False)
+        img.save(out, format="JPEG", quality=75, optimize=False)
         return out.getvalue(), "image/jpeg"
     except Exception:
         return image_bytes, "image/png"
@@ -113,9 +114,32 @@ def format_final_output(raw_text: str) -> str:
         return first_word
 
 
+def delete_previous_telegram_message(chat_id, message_id):
+    if not BOT_TOKEN or not chat_id or not message_id:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "message_id": message_id
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except Exception:
+        pass
+
+
 def send_telegram(chat_id, text):
+    global last_sent_msg_id
     if not BOT_TOKEN or not chat_id:
         return
+
+    # Borrar el mensaje anterior en un hilo secundario para no retrasar el envio
+    prev_id = last_sent_msg_id
+    if prev_id:
+        threading.Thread(target=delete_previous_telegram_message, args=(chat_id, prev_id), daemon=True).start()
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
         "chat_id": chat_id,
@@ -124,7 +148,9 @@ def send_telegram(chat_id, text):
     try:
         req = urllib.request.Request(url, data=data)
         with urllib.request.urlopen(req, timeout=6) as resp:
-            resp.read()
+            res_data = json.loads(resp.read().decode("utf-8"))
+            if res_data.get("ok"):
+                last_sent_msg_id = res_data["result"]["message_id"]
     except Exception as e:
         print(f"[WARN] Error enviando Telegram: {e}", flush=True)
 
@@ -156,7 +182,7 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                 payload = {
                     "model": model_name,
                     "messages": [{"role": "user", "content": content_list}],
-                    "max_tokens": 45,
+                    "max_tokens": 25,
                     "temperature": 0.0
                 }
                 req = urllib.request.Request(
@@ -167,13 +193,13 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                         "Content-Type": "application/json"
                     }
                 )
-                with urllib.request.urlopen(req, timeout=12) as resp:
+                with urllib.request.urlopen(req, timeout=8) as resp:
                     r_data = json.loads(resp.read().decode("utf-8"))
                 ans = r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 if ans:
                     final_out = format_final_output(ans)
                     used = r_data.get("usage", {}).get("total_tokens", "?")
-                    print(f"[OK {model_name} | {used} tok -> {final_out}] {ans}", flush=True)
+                    print(f"[TURBO {model_name} | {used} tok -> {final_out}] {ans}", flush=True)
                     return final_out
             except Exception as e:
                 print(f"[WARN] {model_name}: {e}", flush=True)
@@ -185,11 +211,11 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{"parts": parts}],
-            "generationConfig": {"thinkingConfig": {"thinkingBudget": 128}, "temperature": 0.0}
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": 96}, "temperature": 0.0}
         }
         try:
             req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             candidates = data.get("candidates", [])
             if candidates:
@@ -220,7 +246,7 @@ def process_ntfy_event(ev):
         att_type = att.get("type", "").lower()
         try:
             req_att = urllib.request.Request(att_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_att, timeout=10) as r_att:
+            with urllib.request.urlopen(req_att, timeout=8) as r_att:
                 content_bytes = r_att.read()
             if len(content_bytes) == 0:
                 return
@@ -231,7 +257,7 @@ def process_ntfy_event(ev):
                 mime = "image/jpeg" if (att_name.endswith(".jpg") or att_name.endswith(".jpeg") or "jpeg" in att_type) else "image/png"
                 ans = ask_ai(image_bytes=content_bytes, mime_type=mime)
             send_telegram(DEFAULT_CHAT_ID, ans)
-            print(f"[INSTANT OK] Respondido ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+            print(f"[RAPIDO OK] Respondido ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
         except Exception as e:
             print(f"[ERR] Procesando attachment ntfy: {e}", flush=True)
     else:
@@ -240,14 +266,14 @@ def process_ntfy_event(ev):
             return
         ans = ask_ai(text_input=msg_text)
         send_telegram(DEFAULT_CHAT_ID, ans)
-        print(f"[INSTANT OK] Respondido texto ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+        print(f"[RAPIDO OK] Respondido texto ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
 
 
 def init_ntfy_history():
     try:
         url = f"https://ntfy.sh/{NTFY_TOPIC}/json?poll=1&since=2m"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             for line in resp.read().decode("utf-8", errors="replace").splitlines():
                 if line.strip():
                     ev = json.loads(line)
@@ -258,12 +284,8 @@ def init_ntfy_history():
 
 
 def stream_ntfy_loop():
-    """
-    Usa readline() sin buffer de 8KB para detectar el mensaje en 0.001s apenas llega a ntfy.sh
-    (corrige el retraso de 5-15 segundos del iterador for line in resp de Python).
-    """
     init_ntfy_history()
-    print("[STREAM] Escuchando ntfy con readline() sin buffer (latencia 1ms)...", flush=True)
+    print("[STREAM] Escuchando ntfy en vivo...", flush=True)
     while time.time() - START_TIME < MAX_RUNTIME_SECONDS:
         try:
             conn = http.client.HTTPSConnection("ntfy.sh", timeout=75)
@@ -281,14 +303,14 @@ def stream_ntfy_loop():
                     threading.Thread(target=process_ntfy_event, args=(ev,), daemon=True).start()
             conn.close()
         except Exception:
-            time.sleep(0.2)
+            time.sleep(0.15)
 
 
 def init_telegram_offset():
     global last_update_id
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset=-1&timeout=1"
-        with urllib.request.urlopen(url, timeout=6) as resp:
+        with urllib.request.urlopen(url, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         for upd in data.get("result", []):
             last_update_id = max(last_update_id, upd["update_id"])
@@ -302,8 +324,8 @@ def poll_telegram_loop():
     while time.time() - START_TIME < MAX_RUNTIME_SECONDS:
         try:
             offset = last_update_id + 1
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
-            with urllib.request.urlopen(url, timeout=25) as resp:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=15"
+            with urllib.request.urlopen(url, timeout=20) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             for upd in data.get("result", []):
                 last_update_id = upd["update_id"]
@@ -315,9 +337,9 @@ def poll_telegram_loop():
                 if "photo" in msg:
                     best_photo = msg["photo"][-1]
                     url_f = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={best_photo['file_id']}"
-                    with urllib.request.urlopen(url_f, timeout=10) as rf:
+                    with urllib.request.urlopen(url_f, timeout=8) as rf:
                         fp = json.loads(rf.read().decode("utf-8"))["result"]["file_path"]
-                    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fp}", timeout=15) as r_img:
+                    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fp}", timeout=10) as r_img:
                         img_bytes = r_img.read()
                     ans = ask_ai(text_input=msg.get("caption", ""), image_bytes=img_bytes, mime_type="image/jpeg")
                     send_telegram(chat_id, ans)
@@ -328,7 +350,7 @@ def poll_telegram_loop():
                         custom_context = txt[10:].strip()
                         send_telegram(chat_id, f"✅ Contexto: {custom_context}")
                     elif txt.lower() in ("/start", "hola", "/estado", "estado"):
-                        send_telegram(chat_id, "⚡ Activo sin buffer (1ms)")
+                        send_telegram(chat_id, "⚡ Bot activo (Auto-Borrado anterior)")
                     else:
                         ans = ask_ai(text_input=txt)
                         send_telegram(chat_id, ans)
