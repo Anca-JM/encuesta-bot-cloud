@@ -25,6 +25,7 @@ jobs:
       - name: Run 24/7 Real-Time Listener
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           CHAT_ID: ${{ secrets.CHAT_ID }}

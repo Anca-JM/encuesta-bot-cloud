@@ -11,13 +11,14 @@ import urllib.error
 sys.stdout.reconfigure(encoding="utf-8")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "jafet_encuesta_903689").strip()
 DEFAULT_CHAT_ID = int(os.environ.get("CHAT_ID", "7835887634").strip())
 GH_PAT = os.environ.get("GH_PAT", "").strip()
 GH_REPO = os.environ.get("GITHUB_REPOSITORY", "Anca-JM/encuesta-bot-cloud").strip()
 
-MAX_RUNTIME_SECONDS = 5 * 3600 + 25 * 60  # 5h 25m (antes del limite de 6h de GitHub Actions)
+MAX_RUNTIME_SECONDS = 5 * 3600 + 25 * 60  # 5h 25m
 START_TIME = time.time()
 
 lock = threading.Lock()
@@ -52,50 +53,87 @@ def send_telegram(chat_id, text):
         print(f"[WARN] Error enviando Telegram: {e}", flush=True)
 
 
-def ask_gemini(text_input=None, image_bytes=None, mime_type="image/png"):
+def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
     prompt = SYSTEM_PROMPT
     if custom_context:
         prompt += f"\n\nContexto adicional indicado por el usuario: {custom_context}"
     if text_input:
         prompt += f"\n\nContenido de texto detectado en pantalla:\n{text_input}"
 
-    parts = [{"text": prompt}]
-    if image_bytes:
-        b64_img = base64.b64encode(image_bytes).decode("utf-8")
-        parts.append({
-            "inline_data": {
-                "mime_type": mime_type,
-                "data": b64_img
-            }
-        })
+    b64_img = base64.b64encode(image_bytes).decode("utf-8") if image_bytes else None
 
-    models_to_try = [
-        ("gemini-3.5-flash", {"thinkingConfig": {"thinkingBudget": 0}}),
-        ("gemini-3.5-flash-lite", {}),
-        ("gemini-3.8-flash", {"thinkingConfig": {"thinkingBudget": 0}}),
-    ]
-
-    for model_name, gen_cfg in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-        payload = {"contents": [{"parts": parts}]}
-        if gen_cfg:
-            payload["generationConfig"] = gen_cfg
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=18) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            candidates = data.get("candidates", [])
-            if candidates:
-                ans = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+    # 1. Motor Principal: OpenAI GPT (gpt-4o -> gpt-4.1-mini -> gpt-4o-mini)
+    if OPENAI_API_KEY:
+        content_list = [{"type": "text", "text": prompt}]
+        if b64_img:
+            content_list.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{b64_img}",
+                    "detail": "auto"
+                }
+            })
+        for gpt_model in ["gpt-4o", "gpt-4.1-mini", "gpt-4o-mini"]:
+            try:
+                payload = {
+                    "model": gpt_model,
+                    "messages": [{"role": "user", "content": content_list}],
+                    "max_tokens": 180,
+                    "temperature": 0.1
+                }
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=16) as resp:
+                    r_data = json.loads(resp.read().decode("utf-8"))
+                ans = r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 if ans:
                     return ans
-        except Exception as e:
-            print(f"[WARN] Fallo con {model_name}: {e}", flush=True)
-            continue
+            except Exception as e:
+                print(f"[WARN] Fallo OpenAI {gpt_model}: {e}", flush=True)
+                continue
+
+    # 2. Motor de Respaldo Automatico: Gemini Flash
+    if GEMINI_API_KEY:
+        parts = [{"text": prompt}]
+        if b64_img:
+            parts.append({
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": b64_img
+                }
+            })
+        models_to_try = [
+            ("gemini-3.5-flash", {"thinkingConfig": {"thinkingBudget": 0}}),
+            ("gemini-3.5-flash-lite", {}),
+            ("gemini-3.8-flash", {"thinkingConfig": {"thinkingBudget": 0}}),
+        ]
+        for model_name, gen_cfg in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+            payload = {"contents": [{"parts": parts}]}
+            if gen_cfg:
+                payload["generationConfig"] = gen_cfg
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=16) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates", [])
+                if candidates:
+                    ans = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                    if ans:
+                        return ans
+            except Exception as e:
+                print(f"[WARN] Fallo Gemini {model_name}: {e}", flush=True)
+                continue
 
     return "⚠️ No pude leer la pregunta en este intento. Presiona el botón nuevamente."
 
@@ -123,10 +161,10 @@ def process_ntfy_event(ev):
                 return
             if att_name.endswith(".txt") or att_type.startswith("text/"):
                 txt = content_bytes.decode("utf-8", errors="replace")
-                ans = ask_gemini(text_input=txt)
+                ans = ask_ai(text_input=txt)
             else:
                 mime = "image/jpeg" if (att_name.endswith(".jpg") or att_name.endswith(".jpeg") or "jpeg" in att_type) else "image/png"
-                ans = ask_gemini(image_bytes=content_bytes, mime_type=mime)
+                ans = ask_ai(image_bytes=content_bytes, mime_type=mime)
             send_telegram(DEFAULT_CHAT_ID, ans)
             print(f"[OK] Respondido ntfy attachment en {round(time.time() - t0, 2)}s", flush=True)
         except Exception as e:
@@ -135,13 +173,12 @@ def process_ntfy_event(ev):
         msg_text = (ev.get("message") or "").strip()
         if not msg_text or msg_text == "triggered":
             return
-        ans = ask_gemini(text_input=msg_text)
+        ans = ask_ai(text_input=msg_text)
         send_telegram(DEFAULT_CHAT_ID, ans)
         print(f"[OK] Respondido ntfy texto en {round(time.time() - t0, 2)}s", flush=True)
 
 
 def init_ntfy_history():
-    """Marca como vistos los mensajes viejos antes de iniciar el stream en vivo."""
     try:
         url = f"https://ntfy.sh/{NTFY_TOPIC}/json?poll=1&since=2m"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -157,7 +194,7 @@ def init_ntfy_history():
 
 def stream_ntfy_loop():
     init_ntfy_history()
-    print("[STREAM] Escuchando ntfy en tiempo real (0ms latencia)...", flush=True)
+    print("[STREAM] Escuchando ntfy en tiempo real con GPT + Gemini (0ms latencia)...", flush=True)
     while time.time() - START_TIME < MAX_RUNTIME_SECONDS:
         try:
             url = f"https://ntfy.sh/{NTFY_TOPIC}/json"
@@ -212,7 +249,7 @@ def poll_telegram_loop():
                         fp = json.loads(rf.read().decode("utf-8"))["result"]["file_path"]
                     with urllib.request.urlopen(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fp}", timeout=15) as r_img:
                         img_bytes = r_img.read()
-                    ans = ask_gemini(text_input=msg.get("caption", ""), image_bytes=img_bytes, mime_type="image/jpeg")
+                    ans = ask_ai(text_input=msg.get("caption", ""), image_bytes=img_bytes, mime_type="image/jpeg")
                     send_telegram(chat_id, ans)
 
                 elif "text" in msg:
@@ -221,9 +258,9 @@ def poll_telegram_loop():
                         custom_context = txt[10:].strip()
                         send_telegram(chat_id, f"✅ Contexto actualizado: {custom_context}")
                     elif txt.lower() in ("/start", "hola", "/estado", "estado"):
-                        send_telegram(chat_id, "🟢 Bot 24/7 activo en la nube (GitHub). Presiona el botón en tu celular o envíame una captura/pregunta.")
+                        send_telegram(chat_id, "🟢 Bot 24/7 activo en la nube (GPT-4o + Gemini). Presiona el botón en tu celular o envíame una captura/pregunta.")
                     else:
-                        ans = ask_gemini(text_input=txt)
+                        ans = ask_ai(text_input=txt)
                         send_telegram(chat_id, ans)
         except Exception:
             time.sleep(1)
