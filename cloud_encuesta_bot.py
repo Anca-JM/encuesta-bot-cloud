@@ -48,26 +48,28 @@ CODE_WORDS = {
 
 SYSTEM_PROMPT = (
     "Analiza la pregunta PRINCIPAL de la imagen (ignora miniaturas o barras del navegador).\n"
-    "- Si las opciones tienen letra (A, B, C, D), usa esa letra. Si NO tienen letra, cuéntalas de arriba a abajo: 1=A, 2=B, 3=C, 4=D.\n"
-    "- En 1 sola frase corta (máximo 15 palabras) identifica el concepto académico exacto descartando trampas y cierra obligatoriamente con <R>LETRA</R> (ej. <R>A</R>, <R>B</R>, <R>C</R> o <R>D</R>)."
+    "Primero razona en 1 sola frase corta (máximo 15 palabras) cuál es la respuesta académica exacta descartando trampas.\n"
+    "Al final cierra OBLIGATORIAMENTE con la etiqueta <R>VALOR</R> siguiendo estas reglas estrictas según el tipo de pregunta:\n"
+    "1. Si la pregunta es de VERDADERO o FALSO: escribe <R>V</R> (si es Verdadero) o <R>F</R> (si es Falso).\n"
+    "2. Si la pregunta es de SÍ o NO: escribe <R>S</R> (si es Sí) o <R>N</R> (si es No).\n"
+    "3. Si es de OPCIÓN MÚLTIPLE (3 o 4 opciones con o sin letra A, B, C, D; si no tienen letra cuéntalas de arriba a abajo 1=A, 2=B, 3=C, 4=D): escribe <R>A</R>, <R>B</R>, <R>C</R> o <R>D</R>.\n"
+    "4. Si es CUALQUIER OTRO TIPO DE PREGUNTA (abierta, rellenar, más opciones o diferente): escribe dentro de <R>...</R> ÚNICAMENTE la primera palabra de la respuesta correcta (ejemplo: si la respuesta es 'El tronco de un árbol', escribe <R>El</R>; si es una sola palabra, escribe su inicial o primera palabra)."
 )
 
 
 def prepare_image_smart_crop(image_bytes: bytes):
     """
     Recorta automáticamente las franjas negras vacías de la captura y ajusta a 800px.
-    Ahorra hasta 85% de tokens de imagen y hace que las letras pequeñas se vean mucho más grandes y claras.
+    Ahorra hasta 85% de tokens de imagen y hace que las letras pequeñas se vean más claras.
     """
     if not HAS_PIL:
         return image_bytes, "image/png"
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        # Recortar barras superiores/inferiores negras si existen
         bg = Image.new("RGB", img.size, (0, 0, 0))
         diff = ImageChops.difference(img, bg).convert("L").point(lambda x: 255 if x > 20 else 0)
         bbox = diff.getbbox()
         if bbox:
-            # Dejar un pequeño margen de 10px
             left = max(0, bbox[0] - 10)
             top = max(0, bbox[1] - 10)
             right = min(img.width, bbox[2] + 10)
@@ -86,32 +88,36 @@ def prepare_image_smart_crop(image_bytes: bytes):
         return image_bytes, "image/png"
 
 
-def extract_letter_from_reasoning(raw_text: str):
-    if not raw_text:
-        return None
-    m = re.search(r"<R>\s*([A-D1-4])\s*</R>", raw_text, re.I)
-    if m:
-        ch = m.group(1).upper()
-        return {"1": "A", "2": "B", "3": "C", "4": "D"}.get(ch, ch)
-
-    m2 = re.findall(r"(?:correcta\s+es|respuesta\s*[:es]*)\s*(?:la\s+|opci[oó]n\s+)?([A-D1-4])\b", raw_text, re.I)
-    if m2:
-        ch = m2[-1].upper()
-        return {"1": "A", "2": "B", "3": "C", "4": "D"}.get(ch, ch)
-
-    cleaned = raw_text.strip().upper()
-    if cleaned in ("A", "B", "C", "D", "1", "2", "3", "4"):
-        return {"1": "A", "2": "B", "3": "C", "4": "D"}.get(cleaned, cleaned)
-    return None
-
-
-def letter_to_codeword(letter: str) -> str:
+def format_final_output(raw_text: str) -> str:
     global toggle_idx
+    if not raw_text:
+        return "..."
+
+    m = re.search(r"<R>\s*([^<]+?)\s*</R>", raw_text, re.I)
+    val = m.group(1).strip() if m else raw_text.strip().split()[-1].strip(".,:;()")
+    val_upper = val.upper()
+
     with lock:
-        words = CODE_WORDS.get(letter.upper(), ["..."])
-        word = words[toggle_idx % len(words)]
-        toggle_idx += 1
-        return word
+        # Caso A/B/C/D o 1/2/3/4 -> Palabra clave de la tabla (Árbol/Barco/Casa/Dedo)
+        if val_upper in CODE_WORDS:
+            words = CODE_WORDS[val_upper]
+            word = words[toggle_idx % len(words)]
+            toggle_idx += 1
+            return word
+
+        # Caso Verdadero/Falso o Sí/No -> V, F, S, N
+        if val_upper in ("V", "VERDADERO", "TRUE"):
+            return "V"
+        if val_upper in ("F", "FALSO", "FALSE"):
+            return "F"
+        if val_upper in ("S", "SI", "SÍ", "YES"):
+            return "S"
+        if val_upper in ("N", "NO"):
+            return "N"
+
+        # Caso respuesta diferente -> Primera palabra (ej. "El tronco de un árbol" -> "El")
+        first_word = val.split()[0] if val.split() else val
+        return first_word
 
 
 def send_telegram(chat_id, text):
@@ -142,7 +148,7 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
         cropped_bytes, mime_type = prepare_image_smart_crop(image_bytes)
         b64_img = base64.b64encode(cropped_bytes).decode("utf-8")
 
-    # 1. Un solo llamado ultra-eficiente a OpenAI gpt-4.1-mini (ahorra 85% de tokens y responde en ~1.8s)
+    # 1. Motor Principal ultra-eficiente: OpenAI gpt-4.1-mini
     if OPENAI_API_KEY:
         content_list = [{"type": "text", "text": prompt}]
         if b64_img:
@@ -158,7 +164,7 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                 payload = {
                     "model": model_name,
                     "messages": [{"role": "user", "content": content_list}],
-                    "max_tokens": 50,
+                    "max_tokens": 55,
                     "temperature": 0.0
                 }
                 req = urllib.request.Request(
@@ -172,12 +178,11 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                 with urllib.request.urlopen(req, timeout=14) as resp:
                     r_data = json.loads(resp.read().decode("utf-8"))
                 ans = r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                letter = extract_letter_from_reasoning(ans)
-                if letter:
-                    codeword = letter_to_codeword(letter)
+                if ans:
+                    final_out = format_final_output(ans)
                     used = r_data.get("usage", {}).get("total_tokens", "?")
-                    print(f"[OK {model_name} | {used} tokens -> {letter} -> {codeword}] {ans}", flush=True)
-                    return codeword
+                    print(f"[OK {model_name} | {used} tokens -> {final_out}] {ans}", flush=True)
+                    return final_out
             except Exception as e:
                 print(f"[WARN] {model_name}: {e}", flush=True)
 
@@ -199,9 +204,8 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
             if candidates:
                 parts_out = candidates[0].get("content", {}).get("parts", [])
                 ans = "\n".join(p.get("text", "") for p in parts_out).strip()
-                letter = extract_letter_from_reasoning(ans)
-                if letter:
-                    return letter_to_codeword(letter)
+                if ans:
+                    return format_final_output(ans)
         except Exception as e:
             print(f"[WARN] Gemini fallback: {e}", flush=True)
 
@@ -264,7 +268,7 @@ def init_ntfy_history():
 
 def stream_ntfy_loop():
     init_ntfy_history()
-    print("[STREAM] Escuchando ntfy en Modo Inteligente Ahorro de Tokens...", flush=True)
+    print("[STREAM] Escuchando ntfy en tiempo real...", flush=True)
     while time.time() - START_TIME < MAX_RUNTIME_SECONDS:
         try:
             url = f"https://ntfy.sh/{NTFY_TOPIC}/json"
@@ -327,7 +331,7 @@ def poll_telegram_loop():
                         custom_context = txt[10:].strip()
                         send_telegram(chat_id, f"✅ Contexto: {custom_context}")
                     elif txt.lower() in ("/start", "hola", "/estado", "estado"):
-                        send_telegram(chat_id, "🧠 Activo (Ahorro de Tokens + Anti-Trampa)")
+                        send_telegram(chat_id, "🧠 Activo (A/B/C/D + V/F + S/N + 1ra palabra)")
                     else:
                         ans = ask_ai(text_input=txt)
                         send_telegram(chat_id, ans)
