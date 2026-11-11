@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import time
 import json
 import base64
@@ -25,16 +26,48 @@ lock = threading.Lock()
 seen_ntfy_ids = set()
 last_update_id = 0
 custom_context = ""
+toggle_idx = 0
+
+CODE_WORDS = {
+    "A": ["Árbol", "Ámbar"],
+    "1": ["Árbol", "Ámbar"],
+    "B": ["Barco", "Bosque"],
+    "2": ["Barco", "Bosque"],
+    "C": ["Casa", "Cielo"],
+    "3": ["Casa", "Cielo"],
+    "D": ["Dedo", "Duna"],
+    "4": ["Dedo", "Duna"],
+}
 
 SYSTEM_PROMPT = (
-    "Eres un asistente experto en resolver preguntas de encuestas, cuestionarios y exámenes en tiempo real. "
-    "Lee la imagen o texto de la pantalla del teléfono y responde en español de forma ULTRA CORTA Y DIRECTA "
-    "(ideal para leer en el banner de notificación de Telegram sin abrir la app):\n"
-    "• Primera línea: ✅ Respuesta: [Opción correcta exacta]\n"
-    "• Si hay varias preguntas visibles en la captura, pon la respuesta de cada una numerada.\n"
-    "• Si es una encuesta de opinión/escala (ej. Totalmente de acuerdo, Del 1 al 5) sin respuesta única, "
-    "sugiere la opción más coherente y positiva según el contexto."
+    "Eres un experto resolviendo preguntas de encuestas, exámenes y cuestionarios a partir de capturas de pantalla. "
+    "Tu única tarea es identificar cuál es la opción correcta entre las opciones que aparecen en pantalla.\n"
+    "REGLAS ESTRICTAS DE POSICIÓN:\n"
+    "- Si las opciones tienen letra (A, B, C, D), identifica la letra correcta.\n"
+    "- Si las opciones NO tienen letra, cuéntalas de ARRIBA hacia ABAJO (1 = primera opción arriba, 2 = segunda, 3 = tercera, 4 = cuarta).\n"
+    "- Responde ÚNICAMENTE con una sola letra mayúscula: A, B, C o D (donde 1=A, 2=B, 3=C, 4=D).\n"
+    "- NO escribas explicaciones, ni puntuación, ni palabras adicionales. Solo la letra A, B, C o D."
 )
+
+
+def letter_to_codeword(raw_ans: str) -> str:
+    global toggle_idx
+    cleaned = raw_ans.strip().upper()
+    # Check if AI already returned one of the codewords or a letter/number
+    for key in ["A", "B", "C", "D", "1", "2", "3", "4"]:
+        if re.search(rf"\b{key}\b", cleaned) or cleaned.startswith(key):
+            words = CODE_WORDS[key]
+            word = words[toggle_idx % 2]
+            toggle_idx += 1
+            return word
+    # Fallback search first character A-D or 1-4 anywhere
+    for ch in cleaned:
+        if ch in CODE_WORDS:
+            words = CODE_WORDS[ch]
+            word = words[toggle_idx % 2]
+            toggle_idx += 1
+            return word
+    return raw_ans.strip()
 
 
 def send_telegram(chat_id, text):
@@ -56,9 +89,9 @@ def send_telegram(chat_id, text):
 def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
     prompt = SYSTEM_PROMPT
     if custom_context:
-        prompt += f"\n\nContexto adicional indicado por el usuario: {custom_context}"
+        prompt += f"\n\nContexto adicional: {custom_context}"
     if text_input:
-        prompt += f"\n\nContenido de texto detectado en pantalla:\n{text_input}"
+        prompt += f"\n\nTexto en pantalla:\n{text_input}"
 
     b64_img = base64.b64encode(image_bytes).decode("utf-8") if image_bytes else None
 
@@ -78,8 +111,8 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                 payload = {
                     "model": gpt_model,
                     "messages": [{"role": "user", "content": content_list}],
-                    "max_tokens": 180,
-                    "temperature": 0.1
+                    "max_tokens": 10,
+                    "temperature": 0.0
                 }
                 req = urllib.request.Request(
                     "https://api.openai.com/v1/chat/completions",
@@ -89,11 +122,11 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                         "Content-Type": "application/json"
                     }
                 )
-                with urllib.request.urlopen(req, timeout=16) as resp:
+                with urllib.request.urlopen(req, timeout=15) as resp:
                     r_data = json.loads(resp.read().decode("utf-8"))
                 ans = r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 if ans:
-                    return ans
+                    return letter_to_codeword(ans)
             except Exception as e:
                 print(f"[WARN] Fallo OpenAI {gpt_model}: {e}", flush=True)
                 continue
@@ -124,18 +157,18 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=16) as resp:
+                with urllib.request.urlopen(req, timeout=15) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 candidates = data.get("candidates", [])
                 if candidates:
                     ans = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
                     if ans:
-                        return ans
+                        return letter_to_codeword(ans)
             except Exception as e:
                 print(f"[WARN] Fallo Gemini {model_name}: {e}", flush=True)
                 continue
 
-    return "⚠️ No pude leer la pregunta en este intento. Presiona el botón nuevamente."
+    return "..."
 
 
 def process_ntfy_event(ev):
@@ -166,7 +199,7 @@ def process_ntfy_event(ev):
                 mime = "image/jpeg" if (att_name.endswith(".jpg") or att_name.endswith(".jpeg") or "jpeg" in att_type) else "image/png"
                 ans = ask_ai(image_bytes=content_bytes, mime_type=mime)
             send_telegram(DEFAULT_CHAT_ID, ans)
-            print(f"[OK] Respondido ntfy attachment en {round(time.time() - t0, 2)}s", flush=True)
+            print(f"[OK] Respondido ntfy attachment ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
         except Exception as e:
             print(f"[ERR] Procesando attachment ntfy: {e}", flush=True)
     else:
@@ -175,7 +208,7 @@ def process_ntfy_event(ev):
             return
         ans = ask_ai(text_input=msg_text)
         send_telegram(DEFAULT_CHAT_ID, ans)
-        print(f"[OK] Respondido ntfy texto en {round(time.time() - t0, 2)}s", flush=True)
+        print(f"[OK] Respondido ntfy texto ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
 
 
 def init_ntfy_history():
@@ -194,7 +227,7 @@ def init_ntfy_history():
 
 def stream_ntfy_loop():
     init_ntfy_history()
-    print("[STREAM] Escuchando ntfy en tiempo real con GPT + Gemini (0ms latencia)...", flush=True)
+    print("[STREAM] Escuchando ntfy en tiempo real con tabla de codigos...", flush=True)
     while time.time() - START_TIME < MAX_RUNTIME_SECONDS:
         try:
             url = f"https://ntfy.sh/{NTFY_TOPIC}/json"
@@ -258,7 +291,7 @@ def poll_telegram_loop():
                         custom_context = txt[10:].strip()
                         send_telegram(chat_id, f"✅ Contexto actualizado: {custom_context}")
                     elif txt.lower() in ("/start", "hola", "/estado", "estado"):
-                        send_telegram(chat_id, "🟢 Bot 24/7 activo en la nube (GPT-4o + Gemini). Presiona el botón en tu celular o envíame una captura/pregunta.")
+                        send_telegram(chat_id, "🟢 Activo (Modo Clave: Árbol/Barco/Casa/Dedo)")
                     else:
                         ans = ask_ai(text_input=txt)
                         send_telegram(chat_id, ans)
