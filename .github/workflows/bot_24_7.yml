@@ -22,6 +22,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install fast image compressor
+        run: pip install pillow -q
+
       - name: Run 24/7 Real-Time Listener
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
