@@ -35,7 +35,7 @@ seen_ntfy_ids = set()
 last_update_id = 0
 custom_context = ""
 toggle_idx = 0
-last_sent_msg_id = None  # Almacena el ID del ultimo mensaje enviado para borrarlo al llegar el nuevo
+last_sent_msg_id = None
 
 CODE_WORDS = {
     "A": ["Árbol", "Ámbar"],
@@ -46,40 +46,36 @@ CODE_WORDS = {
     "3": ["Casa", "Cielo"],
     "D": ["Dedo", "Duna"],
     "4": ["Dedo", "Duna"],
+    "E": ["Eco", "Eje"],
+    "5": ["Eco", "Eje"],
 }
 
 SYSTEM_PROMPT = (
-    "Analiza la pregunta PRINCIPAL de la imagen (ignora miniaturas o barras del navegador).\n"
-    "En máximo 8 palabras identifica el concepto exacto descartando trampas y cierra con <R>VALOR</R>:\n"
-    "1. VERDADERO/FALSO: <R>V</R> o <R>F</R>.\n"
-    "2. SÍ/NO: <R>S</R> o <R>N</R>.\n"
-    "3. OPCIÓN MÚLTIPLE (A, B, C, D o de arriba a abajo 1=A, 2=B, 3=C, 4=D): <R>A</R>, <R>B</R>, <R>C</R> o <R>D</R>.\n"
-    "4. OTRO TIPO: escribe dentro de <R>...</R> SOLO la primera palabra de la opción correcta (ej: <R>El</R>)."
+    "Eres un profesor universitario experto en responder cuestionarios y exámenes con 100% de precisión.\n"
+    "Enfócate exclusivamente en la pregunta activa principal (ejemplo: si es un chat o hilo de preguntas, analiza únicamente la última pregunta de abajo).\n"
+    "PASOS OBLIGATORIOS:\n"
+    "1. Lee el enunciado y haz el cálculo matemático, fórmula o análisis conceptual en 1-2 líneas cortas para descartar trampas.\n"
+    "2. Cierra OBLIGATORIAMENTE en una nueva línea con la etiqueta exacta: <R>VALOR</R> según estas reglas:\n"
+    "   • Si las opciones son letras (a, b, c, d, e): pon la letra exacta dentro de <R>, ej: <R>d</R> o <R>b</R>.\n"
+    "   • Si NO tienen letra, numéralas de arriba hacia abajo (1ra=A, 2da=B, 3ra=C, 4ta=D, 5ta=E): pon la letra correspondiente.\n"
+    "   • Si es VERDADERO o FALSO: <R>V</R> o <R>F</R>.\n"
+    "   • Si es SÍ o NO: <R>S</R> o <R>N</R>.\n"
+    "   • Si es pregunta abierta u otro tipo: escribe dentro de <R>...</R> ÚNICAMENTE la primera palabra de la respuesta correcta (ej: <R>El</R>)."
 )
 
 
-def prepare_image_smart_crop(image_bytes: bytes):
+def prepare_image(image_bytes: bytes):
     if not HAS_PIL:
         return image_bytes, "image/png"
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        bg = Image.new("RGB", img.size, (0, 0, 0))
-        diff = ImageChops.difference(img, bg).convert("L").point(lambda x: 255 if x > 20 else 0)
-        bbox = diff.getbbox()
-        if bbox:
-            left = max(0, bbox[0] - 10)
-            top = max(0, bbox[1] - 10)
-            right = min(img.width, bbox[2] + 10)
-            bottom = min(img.height, bbox[3] + 10)
-            if (right - left) > 150 and (bottom - top) > 100:
-                img = img.crop((left, top, right, bottom))
-
         w, h = img.size
-        if max(w, h) > 720:
-            scale = 720.0 / max(w, h)
-            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.BILINEAR)
+        # Si la imagen es muy grande, redimensionamos con suavizado conservando nitidez
+        if max(w, h) > 1080:
+            scale = 1080.0 / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
         out = io.BytesIO()
-        img.save(out, format="JPEG", quality=75, optimize=False)
+        img.save(out, format="JPEG", quality=85, optimize=False)
         return out.getvalue(), "image/jpeg"
     except Exception:
         return image_bytes, "image/png"
@@ -95,6 +91,7 @@ def format_final_output(raw_text: str) -> str:
     val_upper = val.upper()
 
     with lock:
+        # A, B, C, D, E o 1, 2, 3, 4, 5
         if val_upper in CODE_WORDS:
             words = CODE_WORDS[val_upper]
             word = words[toggle_idx % len(words)]
@@ -135,7 +132,7 @@ def send_telegram(chat_id, text):
     if not BOT_TOKEN or not chat_id:
         return
 
-    # Borrar el mensaje anterior en un hilo secundario para no retrasar el envio
+    # Borrar mensaje anterior de forma asíncrona
     prev_id = last_sent_msg_id
     if prev_id:
         threading.Thread(target=delete_previous_telegram_message, args=(chat_id, prev_id), daemon=True).start()
@@ -158,15 +155,16 @@ def send_telegram(chat_id, text):
 def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
     prompt = SYSTEM_PROMPT
     if custom_context:
-        prompt += f"\nContexto: {custom_context}"
+        prompt += f"\nContexto especial: {custom_context}"
     if text_input:
-        prompt += f"\nTexto:\n{text_input}"
+        prompt += f"\nTexto de la pantalla:\n{text_input}"
 
     b64_img = None
     if image_bytes:
-        cropped_bytes, mime_type = prepare_image_smart_crop(image_bytes)
-        b64_img = base64.b64encode(cropped_bytes).decode("utf-8")
+        hd_bytes, mime_type = prepare_image(image_bytes)
+        b64_img = base64.b64encode(hd_bytes).decode("utf-8")
 
+    # 1. OpenAI GPT con razonamiento paso a paso
     if OPENAI_API_KEY:
         content_list = [{"type": "text", "text": prompt}]
         if b64_img:
@@ -177,12 +175,12 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                     "detail": "auto"
                 }
             })
-        for model_name in ["gpt-4.1-mini", "gpt-4o-mini"]:
+        for model_name in ["gpt-4.1-mini", "gpt-4o"]:
             try:
                 payload = {
                     "model": model_name,
                     "messages": [{"role": "user", "content": content_list}],
-                    "max_tokens": 25,
+                    "max_tokens": 140,
                     "temperature": 0.0
                 }
                 req = urllib.request.Request(
@@ -193,17 +191,17 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                         "Content-Type": "application/json"
                     }
                 )
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                with urllib.request.urlopen(req, timeout=14) as resp:
                     r_data = json.loads(resp.read().decode("utf-8"))
                 ans = r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 if ans:
                     final_out = format_final_output(ans)
-                    used = r_data.get("usage", {}).get("total_tokens", "?")
-                    print(f"[TURBO {model_name} | {used} tok -> {final_out}] {ans}", flush=True)
+                    print(f"[{model_name} -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
                     return final_out
             except Exception as e:
                 print(f"[WARN] {model_name}: {e}", flush=True)
 
+    # 2. Respaldo Gemini 3.5 Flash con Thinking
     if GEMINI_API_KEY:
         parts = [{"text": prompt}]
         if b64_img:
@@ -211,11 +209,11 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{"parts": parts}],
-            "generationConfig": {"thinkingConfig": {"thinkingBudget": 96}, "temperature": 0.0}
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": 256}, "temperature": 0.0}
         }
         try:
             req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=12) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             candidates = data.get("candidates", [])
             if candidates:
@@ -246,7 +244,7 @@ def process_ntfy_event(ev):
         att_type = att.get("type", "").lower()
         try:
             req_att = urllib.request.Request(att_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_att, timeout=8) as r_att:
+            with urllib.request.urlopen(req_att, timeout=10) as r_att:
                 content_bytes = r_att.read()
             if len(content_bytes) == 0:
                 return
@@ -257,7 +255,7 @@ def process_ntfy_event(ev):
                 mime = "image/jpeg" if (att_name.endswith(".jpg") or att_name.endswith(".jpeg") or "jpeg" in att_type) else "image/png"
                 ans = ask_ai(image_bytes=content_bytes, mime_type=mime)
             send_telegram(DEFAULT_CHAT_ID, ans)
-            print(f"[RAPIDO OK] Respondido ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+            print(f"[RESUELTO OK] Respondido ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
         except Exception as e:
             print(f"[ERR] Procesando attachment ntfy: {e}", flush=True)
     else:
@@ -266,7 +264,7 @@ def process_ntfy_event(ev):
             return
         ans = ask_ai(text_input=msg_text)
         send_telegram(DEFAULT_CHAT_ID, ans)
-        print(f"[RAPIDO OK] Respondido texto ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+        print(f"[RESUELTO OK] Respondido texto ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
 
 
 def init_ntfy_history():
@@ -350,7 +348,7 @@ def poll_telegram_loop():
                         custom_context = txt[10:].strip()
                         send_telegram(chat_id, f"✅ Contexto: {custom_context}")
                     elif txt.lower() in ("/start", "hola", "/estado", "estado"):
-                        send_telegram(chat_id, "⚡ Bot activo (Auto-Borrado anterior)")
+                        send_telegram(chat_id, "🧠 Modo Alta Precisión Activo")
                     else:
                         ans = ask_ai(text_input=txt)
                         send_telegram(chat_id, ans)
