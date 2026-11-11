@@ -47,15 +47,17 @@ CODE_WORDS = {
 }
 
 SYSTEM_PROMPT = (
-    "Identifica la opción correcta de la pregunta en pantalla.\n"
-    "- Si tienen letra (A, B, C, D), usa esa letra.\n"
-    "- Si NO tienen letra, cuéntalas de arriba a abajo: 1=A, 2=B, 3=C, 4=D.\n"
-    "Responde SOLO UNA LETRA: A, B, C o D."
+    "Eres un catedrático experto en exámenes universitarios, de admisión y encuestas.\n"
+    "Analiza únicamente la pregunta PRINCIPAL que aparece en el centro de la pantalla (ignora miniaturas o bordes del navegador):\n"
+    "1. Lee con máxima atención todo el enunciado y todas las opciones.\n"
+    "2. Si las opciones tienen letra (A, B, C, D), usa esa letra. Si NO tienen letra, cuéntalas de ARRIBA hacia ABAJO: 1ra=A, 2da=B, 3ra=C, 4ta=D.\n"
+    "3. Evalúa brevemente cada opción en 1 línea para descartar distractores o preguntas trampa y confirmar cuál es 100% correcta.\n"
+    "4. Al final de tu análisis escribe OBLIGATORIAMENTE la etiqueta exacta: <R>LETRA</R> (por ejemplo <R>A</R>, <R>B</R>, <R>C</R> o <R>D</R>)."
 )
 
 
-def compress_image_fast(image_bytes: bytes):
-    """Reduce la captura de 1.5MB PNG a ~45KB JPEG en 15ms para que la IA responda 3x mas rapido."""
+def prepare_image_hd(image_bytes: bytes):
+    """Mantiene alta nitidez (1400px JPEG 85%) para leer letras pequeñas sin tardar en subir."""
     if not HAS_PIL:
         return image_bytes, "image/png"
     try:
@@ -63,33 +65,45 @@ def compress_image_fast(image_bytes: bytes):
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
         w, h = img.size
-        if max(w, h) > 960:
-            scale = 960.0 / max(w, h)
-            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.BILINEAR)
+        if max(w, h) > 1400:
+            scale = 1400.0 / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
         out = io.BytesIO()
-        img.save(out, format="JPEG", quality=72, optimize=False)
+        img.save(out, format="JPEG", quality=85, optimize=False)
         return out.getvalue(), "image/jpeg"
     except Exception:
         return image_bytes, "image/png"
 
 
-def letter_to_codeword(raw_ans: str) -> str:
+def extract_letter_from_reasoning(raw_text: str):
+    if not raw_text:
+        return None
+    # 1. Buscar etiqueta explícita <R>X</R>
+    m = re.search(r"<R>\s*([A-D1-4])\s*</R>", raw_text, re.I)
+    if m:
+        ch = m.group(1).upper()
+        return {"1": "A", "2": "B", "3": "C", "4": "D"}.get(ch, ch)
+
+    # 2. Buscar "opción correcta es X" o "Respuesta: X" al final del texto
+    m2 = re.findall(r"(?:correcta\s+es|respuesta\s*[:es]*)\s*(?:la\s+|opci[oó]n\s+)?([A-D1-4])\b", raw_text, re.I)
+    if m2:
+        ch = m2[-1].upper()
+        return {"1": "A", "2": "B", "3": "C", "4": "D"}.get(ch, ch)
+
+    # 3. Si es una sola letra
+    cleaned = raw_text.strip().upper()
+    if cleaned in ("A", "B", "C", "D", "1", "2", "3", "4"):
+        return {"1": "A", "2": "B", "3": "C", "4": "D"}.get(cleaned, cleaned)
+    return None
+
+
+def letter_to_codeword(letter: str) -> str:
     global toggle_idx
-    cleaned = raw_ans.strip().upper()
     with lock:
-        for key in ["A", "B", "C", "D", "1", "2", "3", "4"]:
-            if re.search(rf"\b{key}\b", cleaned) or cleaned.startswith(key):
-                words = CODE_WORDS[key]
-                word = words[toggle_idx % 2]
-                toggle_idx += 1
-                return word
-        for ch in cleaned:
-            if ch in CODE_WORDS:
-                words = CODE_WORDS[ch]
-                word = words[toggle_idx % 2]
-                toggle_idx += 1
-                return word
-    return raw_ans.strip()
+        words = CODE_WORDS.get(letter.upper(), ["..."])
+        word = words[toggle_idx % len(words)]
+        toggle_idx += 1
+        return word
 
 
 def send_telegram(chat_id, text):
@@ -108,7 +122,7 @@ def send_telegram(chat_id, text):
         print(f"[WARN] Error enviando Telegram: {e}", flush=True)
 
 
-def call_openai_single(model_name, prompt, b64_img, mime_type, result_holder, done_event):
+def call_openai_reasoning(model_name, prompt, b64_img, mime_type, result_holder, done_event):
     if not OPENAI_API_KEY or done_event.is_set():
         return
     content_list = [{"type": "text", "text": prompt}]
@@ -117,14 +131,14 @@ def call_openai_single(model_name, prompt, b64_img, mime_type, result_holder, do
             "type": "image_url",
             "image_url": {
                 "url": f"data:{mime_type};base64,{b64_img}",
-                "detail": "low"
+                "detail": "high"
             }
         })
     try:
         payload = {
             "model": model_name,
             "messages": [{"role": "user", "content": content_list}],
-            "max_tokens": 5,
+            "max_tokens": 240,
             "temperature": 0.0
         }
         req = urllib.request.Request(
@@ -135,17 +149,18 @@ def call_openai_single(model_name, prompt, b64_img, mime_type, result_holder, do
                 "Content-Type": "application/json"
             }
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=16) as resp:
             r_data = json.loads(resp.read().decode("utf-8"))
         ans = r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        if ans and not done_event.is_set():
-            result_holder.append(ans)
+        letter = extract_letter_from_reasoning(ans)
+        if letter and not done_event.is_set():
+            result_holder.append((letter, model_name, ans))
             done_event.set()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] {model_name}: {e}", flush=True)
 
 
-def call_gemini_single(model_name, prompt, b64_img, mime_type, result_holder, done_event):
+def call_gemini_reasoning(model_name, prompt, b64_img, mime_type, result_holder, done_event):
     if not GEMINI_API_KEY or done_event.is_set():
         return
     parts = [{"text": prompt}]
@@ -159,7 +174,7 @@ def call_gemini_single(model_name, prompt, b64_img, mime_type, result_holder, do
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": parts}],
-        "generationConfig": {"thinkingConfig": {"thinkingBudget": 0}, "maxOutputTokens": 5, "temperature": 0.0}
+        "generationConfig": {"thinkingConfig": {"thinkingBudget": 384}, "temperature": 0.0}
     }
     try:
         req = urllib.request.Request(
@@ -167,46 +182,50 @@ def call_gemini_single(model_name, prompt, b64_img, mime_type, result_holder, do
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=16) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         candidates = data.get("candidates", [])
         if candidates:
-            ans = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-            if ans and not done_event.is_set():
-                result_holder.append(ans)
+            parts_out = candidates[0].get("content", {}).get("parts", [])
+            ans = "\n".join(p.get("text", "") for p in parts_out).strip()
+            letter = extract_letter_from_reasoning(ans)
+            if letter and not done_event.is_set():
+                result_holder.append((letter, model_name, ans))
                 done_event.set()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] {model_name}: {e}", flush=True)
 
 
 def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
     prompt = SYSTEM_PROMPT
     if custom_context:
-        prompt += f"\nContexto: {custom_context}"
+        prompt += f"\n\nContexto adicional obligatorio: {custom_context}"
     if text_input:
-        prompt += f"\nTexto:\n{text_input}"
+        prompt += f"\n\nTexto detectado en pantalla:\n{text_input}"
 
     b64_img = None
     if image_bytes:
-        fast_bytes, mime_type = compress_image_fast(image_bytes)
-        b64_img = base64.b64encode(fast_bytes).decode("utf-8")
+        hd_bytes, mime_type = prepare_image_hd(image_bytes)
+        b64_img = base64.b64encode(hd_bytes).decode("utf-8")
 
     result_holder = []
     done_event = threading.Event()
 
-    # Carrera en paralelo: dispara GPT-4o, GPT-4.1-mini y Gemini 3.5 Flash al mismo tiempo
-    # El primero que conteste en ~0.9s gana y envia la respuesta al instante!
+    # Dispara GPT-4o (High-Res + Razonamiento), GPT-4.1 y Gemini 3.5 Flash Thinking en paralelo
     threads = [
-        threading.Thread(target=call_openai_single, args=("gpt-4o", prompt, b64_img, mime_type, result_holder, done_event), daemon=True),
-        threading.Thread(target=call_openai_single, args=("gpt-4.1-mini", prompt, b64_img, mime_type, result_holder, done_event), daemon=True),
-        threading.Thread(target=call_gemini_single, args=("gemini-3.5-flash", prompt, b64_img, mime_type, result_holder, done_event), daemon=True),
+        threading.Thread(target=call_openai_reasoning, args=("gpt-4o", prompt, b64_img, mime_type, result_holder, done_event), daemon=True),
+        threading.Thread(target=call_openai_reasoning, args=("gpt-4.1", prompt, b64_img, mime_type, result_holder, done_event), daemon=True),
+        threading.Thread(target=call_gemini_reasoning, args=("gemini-3.5-flash", prompt, b64_img, mime_type, result_holder, done_event), daemon=True),
     ]
     for t in threads:
         t.start()
 
-    done_event.wait(timeout=10.0)
+    done_event.wait(timeout=15.0)
     if result_holder:
-        return letter_to_codeword(result_holder[0])
+        letter, winner_model, full_reasoning = result_holder[0]
+        codeword = letter_to_codeword(letter)
+        print(f"[RAZONAMIENTO {winner_model} -> {letter} -> {codeword}] {full_reasoning[:120].replace(chr(10), ' ')}", flush=True)
+        return codeword
 
     return "..."
 
@@ -228,7 +247,7 @@ def process_ntfy_event(ev):
         att_type = att.get("type", "").lower()
         try:
             req_att = urllib.request.Request(att_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_att, timeout=10) as r_att:
+            with urllib.request.urlopen(req_att, timeout=12) as r_att:
                 content_bytes = r_att.read()
             if len(content_bytes) == 0:
                 return
@@ -239,7 +258,7 @@ def process_ntfy_event(ev):
                 mime = "image/jpeg" if (att_name.endswith(".jpg") or att_name.endswith(".jpeg") or "jpeg" in att_type) else "image/png"
                 ans = ask_ai(image_bytes=content_bytes, mime_type=mime)
             send_telegram(DEFAULT_CHAT_ID, ans)
-            print(f"[TURBO OK] Respondido ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+            print(f"[OK] Respondido ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
         except Exception as e:
             print(f"[ERR] Procesando attachment ntfy: {e}", flush=True)
     else:
@@ -248,7 +267,7 @@ def process_ntfy_event(ev):
             return
         ans = ask_ai(text_input=msg_text)
         send_telegram(DEFAULT_CHAT_ID, ans)
-        print(f"[TURBO OK] Respondido texto ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+        print(f"[OK] Respondido texto ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
 
 
 def init_ntfy_history():
@@ -267,7 +286,7 @@ def init_ntfy_history():
 
 def stream_ntfy_loop():
     init_ntfy_history()
-    print("[TURBO STREAM] Escuchando ntfy en tiempo real...", flush=True)
+    print("[STREAM] Escuchando ntfy en Modo Catedratico HD...", flush=True)
     while time.time() - START_TIME < MAX_RUNTIME_SECONDS:
         try:
             url = f"https://ntfy.sh/{NTFY_TOPIC}/json"
@@ -330,7 +349,7 @@ def poll_telegram_loop():
                         custom_context = txt[10:].strip()
                         send_telegram(chat_id, f"✅ Contexto: {custom_context}")
                     elif txt.lower() in ("/start", "hola", "/estado", "estado"):
-                        send_telegram(chat_id, "⚡ Modo Turbo Activo")
+                        send_telegram(chat_id, "🧠 Modo Catedrático HD Activo")
                     else:
                         ans = ask_ai(text_input=txt)
                         send_telegram(chat_id, ans)
