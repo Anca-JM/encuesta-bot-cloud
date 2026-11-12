@@ -35,7 +35,7 @@ seen_ntfy_ids = set()
 last_update_id = 0
 custom_context = ""
 toggle_idx = 0
-last_sent_msg_id = None
+previous_msg_ids = []
 
 CODE_WORDS = {
     "A": ["Árbol", "Ámbar"],
@@ -51,21 +51,24 @@ CODE_WORDS = {
 }
 
 SYSTEM_PROMPT = (
-    "Eres un profesor universitario experto en responder cuestionarios y exámenes con 100% de precisión.\n"
-    "Enfócate EXCLUSIVAMENTE en la pregunta activa (la última de abajo si hay historial anterior).\n"
-    "PASOS:\n"
-    "1. Escribe el razonamiento o cálculo en 1 línea.\n"
-    "2. Identifica el valor o concepto exacto.\n"
-    "3. Observa las opciones mostradas abajo del enunciado:\n"
-    "   • Si la pregunta pide responder DOS partes distintas (ej: pregunta A y pregunta B):\n"
-    "     Resuelve ambas y escribe: <R>A: [letra/valor] | B: [letra/valor]</R>.\n"
-    "   • Si es una pregunta de opción única:\n"
-    "     - Si las opciones tienen letras (a, b, c, d, e), usa esa letra exacta, ej: <R>D</R>.\n"
-    "     - Si las opciones NO tienen letras, cuéntalas en orden vertical de arriba a abajo: Fila 1 = A, Fila 2 = B, Fila 3 = C, Fila 4 = D, Fila 5 = E. Pon <R>LETRA</R>.\n"
-    "   • Si es Verdadero/Falso: <R>V</R> o <R>F</R>.\n"
-    "   • Si es Sí/No: <R>S</R> o <R>N</R>.\n"
-    "   • Si es pregunta abierta u otro tipo: escribe dentro de <R>...</R> la primera palabra de la respuesta correcta.\n"
-    "4. Concluye OBLIGATORIAMENTE en la última línea con la etiqueta exacta: <R>VALOR</R>."
+    "Eres un examinador de élite con precisión analítica y matemática del 100%.\n"
+    "Enfócate EXCLUSIVAMENTE en la pregunta activa (la última de abajo si hay historial anterior de chat).\n"
+    "PASOS OBLIGATORIOS:\n"
+    "1. Resuelve paso a paso en 1 o 2 líneas exactas (calcula con rigor sin saltarte pasos ni despejes matemáticos).\n"
+    "2. Determina el resultado exacto.\n"
+    "3. Si hay opciones (en lista vertical O en una línea horizontal separadas por puntos •, comas, guiones o espacios):\n"
+    "   - Mapea las opciones en orden de aparición (de izquierda a derecha o de arriba a abajo):\n"
+    "     1ª opción = A\n"
+    "     2ª opción = B\n"
+    "     3ª opción = C\n"
+    "     4ª opción = D\n"
+    "     5ª opción = E\n"
+    "   - En preguntas de opciones tu resultado final DEBE ser solo la letra: <R>A</R>, <R>B</R>, <R>C</R>, <R>D</R> o <R>E</R>. NUNCA pongas el número ni la palabra de la opción.\n"
+    "4. Si es Verdadero/Falso: <R>V</R> o <R>F</R>.\n"
+    "5. Si es Sí/No: <R>S</R> o <R>N</R>.\n"
+    "6. Si pide dos partes (A y B): <R>A: [letra] | B: [letra]</R>.\n"
+    "7. Si es pregunta abierta sin opciones: escribe solo la primera palabra de la respuesta correcta dentro de <R>...</R>.\n"
+    "8. Concluye en la última línea con: <R>LETRA_O_RESPUESTA</R>."
 )
 
 
@@ -90,23 +93,33 @@ def format_final_output(raw_text: str) -> str:
     if not raw_text:
         return "..."
 
-    # Extraer la etiqueta <R>...</R>
-    m = re.search(r"<R>\s*([^<]+?)\s*</R>", raw_text, re.I)
-    if m:
-        val = m.group(1).strip()
-    else:
-        # Fallback si no puso etiqueta
-        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-        val = lines[-1].strip(".,:;() ") if lines else "..."
+    # Extraer etiquetas <R>...</R>
+    tags = re.findall(r"<R>\s*([^<]+?)\s*</R>", raw_text, re.I)
+    valid_tags = [
+        t.strip()
+        for t in tags
+        if t.strip().upper() not in ("VALOR", "RESULTADO", "LETRA_O_RESPUESTA", "ANSWER", "")
+    ]
 
-    # Si es respuesta doble tipo A: ... | B: ...
+    if valid_tags:
+        val = valid_tags[0]
+    else:
+        # Fallback: buscar letra A-E aislada al final
+        m = re.search(r"\b([A-E])\b[^\w]*$", raw_text.strip(), re.I)
+        if m:
+            val = m.group(1)
+        else:
+            lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+            val = lines[-1].strip(".,:;() ") if lines else "..."
+
+    # Respuesta combinada tipo A: ... | B: ...
     if "|" in val:
         return val
 
     val_upper = val.upper()
 
     with lock:
-        # Mapeo de una letra sola (A-E) a su palabra clave
+        # Mapeo de letra a palabra clave (A->Árbol/Ámbar, B->Barco/Bosque, C->Casa/Cielo, D->Dedo/Duna, E->Eco/Eje)
         if val_upper in CODE_WORDS:
             words = CODE_WORDS[val_upper]
             word = words[toggle_idx % len(words)]
@@ -122,11 +135,12 @@ def format_final_output(raw_text: str) -> str:
         if val_upper in ("N", "NO"):
             return "N"
 
+        # Pregunta abierta: primera palabra
         first_word = val.split()[0] if val.split() else val
         return first_word
 
 
-def delete_previous_telegram_message(chat_id, message_id):
+def delete_single_message(chat_id, message_id):
     if not BOT_TOKEN or not chat_id or not message_id:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
@@ -142,14 +156,15 @@ def delete_previous_telegram_message(chat_id, message_id):
         pass
 
 
+def delete_old_messages(chat_id, msg_ids):
+    for mid in msg_ids:
+        delete_single_message(chat_id, mid)
+
+
 def send_telegram(chat_id, text):
-    global last_sent_msg_id
+    global previous_msg_ids
     if not BOT_TOKEN or not chat_id:
         return
-
-    prev_id = last_sent_msg_id
-    if prev_id:
-        threading.Thread(target=delete_previous_telegram_message, args=(chat_id, prev_id), daemon=True).start()
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
@@ -161,9 +176,44 @@ def send_telegram(chat_id, text):
         with urllib.request.urlopen(req, timeout=6) as resp:
             res_data = json.loads(resp.read().decode("utf-8"))
             if res_data.get("ok"):
-                last_sent_msg_id = res_data["result"]["message_id"]
+                new_id = res_data["result"]["message_id"]
+                with lock:
+                    to_delete = list(previous_msg_ids)
+                    previous_msg_ids = [new_id]
+                if to_delete:
+                    threading.Thread(target=delete_old_messages, args=(chat_id, to_delete), daemon=True).start()
     except Exception as e:
         print(f"[WARN] Error enviando Telegram: {e}", flush=True)
+
+
+def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_type: str = "image/png"):
+    content_list = [{"type": "text", "text": prompt}]
+    if b64_img:
+        content_list.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime_type};base64,{b64_img}",
+                "detail": "high"
+            }
+        })
+
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": content_list}],
+        "max_tokens": 160,
+        "temperature": 0.0
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=14) as resp:
+        r_data = json.loads(resp.read().decode("utf-8"))
+    return r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
 
 def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
@@ -178,64 +228,17 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
         hd_bytes, mime_type = prepare_image(image_bytes)
         b64_img = base64.b64encode(hd_bytes).decode("utf-8")
 
-    # 1. GPT-4o con detail="high" y max_tokens=180 para garantizar que complete el razonamiento y cierre con <R>
+    # 1. GPT-4.1 (Modelo principal de máxima inteligencia y velocidad)
     if OPENAI_API_KEY:
-        content_list = [{"type": "text", "text": prompt}]
-        if b64_img:
-            content_list.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime_type};base64,{b64_img}",
-                    "detail": "high"
-                }
-            })
-        try:
-            payload = {
-                "model": "gpt-4o",
-                "messages": [{"role": "user", "content": content_list}],
-                "max_tokens": 180,
-                "temperature": 0.0
-            }
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=14) as resp:
-                r_data = json.loads(resp.read().decode("utf-8"))
-            ans = r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            if ans:
-                final_out = format_final_output(ans)
-                print(f"[gpt-4o -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
-                return final_out
-        except Exception as e:
-            print(f"[WARN] gpt-4o: {e}", flush=True)
-
-    # 2. Respaldo Gemini 3.5 Flash con Thinking
-    if GEMINI_API_KEY:
-        parts = [{"text": prompt}]
-        if b64_img:
-            parts.append({"inline_data": {"mime_type": mime_type, "data": b64_img}})
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {"thinkingConfig": {"thinkingBudget": 256}, "temperature": 0.0}
-        }
-        try:
-            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=14) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts_out = candidates[0].get("content", {}).get("parts", [])
-                ans = "\n".join(p.get("text", "") for p in parts_out).strip()
+        for model in ("gpt-4.1", "gpt-4o"):
+            try:
+                ans = call_openai_vision(model, prompt, b64_img, mime_type)
                 if ans:
-                    return format_final_output(ans)
-        except Exception as e:
-            print(f"[WARN] Gemini fallback: {e}", flush=True)
+                    final_out = format_final_output(ans)
+                    print(f"[{model} -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
+                    return final_out
+            except Exception as e:
+                print(f"[WARN] {model} fallo: {e}", flush=True)
 
     return "..."
 
@@ -361,7 +364,7 @@ def poll_telegram_loop():
                         custom_context = txt[10:].strip()
                         send_telegram(chat_id, f"✅ Contexto: {custom_context}")
                     elif txt.lower() in ("/start", "hola", "/estado", "estado"):
-                        send_telegram(chat_id, "🧠 Modo GPT-4o 100% Precisión Activo")
+                        send_telegram(chat_id, "🧠 Modo GPT-4.1 Ultra Preciso 24/7 Activo")
                     else:
                         ans = ask_ai(text_input=txt)
                         send_telegram(chat_id, ans)
