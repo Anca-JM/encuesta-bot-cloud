@@ -12,7 +12,7 @@ import urllib.error
 import http.client
 
 try:
-    from PIL import Image, ImageChops
+    from PIL import Image
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -51,13 +51,17 @@ CODE_WORDS = {
 }
 
 SYSTEM_PROMPT = (
-    "Eres un profesor universitario experto en responder cuestionarios y exámenes con 100% de precisión.\n"
-    "Enfócate exclusivamente en la pregunta activa principal (ejemplo: si es un chat o hilo de preguntas, analiza únicamente la última pregunta de abajo).\n"
-    "PASOS OBLIGATORIOS:\n"
-    "1. Lee el enunciado y haz el cálculo matemático, fórmula o análisis conceptual en 1-2 líneas cortas para descartar trampas.\n"
-    "2. Cierra OBLIGATORIAMENTE en una nueva línea con la etiqueta exacta: <R>VALOR</R> según estas reglas:\n"
-    "   • Si las opciones son letras (a, b, c, d, e): pon la letra exacta dentro de <R>, ej: <R>d</R> o <R>b</R>.\n"
-    "   • Si NO tienen letra, numéralas de arriba hacia abajo (1ra=A, 2da=B, 3ra=C, 4ta=D, 5ta=E): pon la letra correspondiente.\n"
+    "Eres un evaluador académico de máxima precisión y rigor universitario.\n"
+    "Tu objetivo es identificar con 100% de certeza la respuesta correcta a la pregunta activa de la pantalla.\n\n"
+    "INSTRUCCIONES CLAVE:\n"
+    "1. Si la captura contiene una conversación, chat o historial anterior (por ejemplo Claude, ChatGPT o un examen previo), "
+    "concéntrate EXCLUSIVAMENTE en la ÚLTIMA pregunta de abajo (la pregunta activa).\n"
+    "2. Lee detenidamente el enunciado, cada opción de respuesta, números, signos y detalles conceptuales sin apresurarte.\n"
+    "3. Si requiere cálculo matemático o aplicación de fórmulas (por ejemplo multiplicadores, tasas, porcentajes), haz el cálculo mental paso a paso para no caer en trampas.\n"
+    "4. Identifica con precisión cuál es la opción correcta.\n"
+    "5. Cierra obligatoriamente en una nueva línea con la etiqueta exacta: <R>VALOR</R> siguiendo estas reglas:\n"
+    "   • Si las opciones son letras (a, b, c, d, e): escribe la letra exacta, ej: <R>a</R>, <R>b</R>, <R>c</R>, <R>d</R> o <R>e</R>.\n"
+    "   • Si las opciones NO tienen letra, cuéntalas de ARRIBA hacia ABAJO: 1ra=A, 2da=B, 3ra=C, 4ta=D, 5ta=E.\n"
     "   • Si es VERDADERO o FALSO: <R>V</R> o <R>F</R>.\n"
     "   • Si es SÍ o NO: <R>S</R> o <R>N</R>.\n"
     "   • Si es pregunta abierta u otro tipo: escribe dentro de <R>...</R> ÚNICAMENTE la primera palabra de la respuesta correcta (ej: <R>El</R>)."
@@ -65,17 +69,17 @@ SYSTEM_PROMPT = (
 
 
 def prepare_image(image_bytes: bytes):
+    """Conserva la imagen completa con alta resolución (1440px) y compresión limpia."""
     if not HAS_PIL:
         return image_bytes, "image/png"
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         w, h = img.size
-        # Si la imagen es muy grande, redimensionamos con suavizado conservando nitidez
-        if max(w, h) > 1080:
-            scale = 1080.0 / max(w, h)
+        if max(w, h) > 1440:
+            scale = 1440.0 / max(w, h)
             img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
         out = io.BytesIO()
-        img.save(out, format="JPEG", quality=85, optimize=False)
+        img.save(out, format="JPEG", quality=88, optimize=False)
         return out.getvalue(), "image/jpeg"
     except Exception:
         return image_bytes, "image/png"
@@ -87,11 +91,17 @@ def format_final_output(raw_text: str) -> str:
         return "..."
 
     m = re.search(r"<R>\s*([^<]+?)\s*</R>", raw_text, re.I)
-    val = m.group(1).strip() if m else raw_text.strip().split()[-1].strip(".,:;()")
+    if m:
+        val = m.group(1).strip()
+    else:
+        # Extraer si puso letra aislada al final
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        val = lines[-1].strip(".,:;() ") if lines else "..."
+
     val_upper = val.upper()
 
     with lock:
-        # A, B, C, D, E o 1, 2, 3, 4, 5
+        # Mapeo a palabra clave
         if val_upper in CODE_WORDS:
             words = CODE_WORDS[val_upper]
             word = words[toggle_idx % len(words)]
@@ -132,7 +142,6 @@ def send_telegram(chat_id, text):
     if not BOT_TOKEN or not chat_id:
         return
 
-    # Borrar mensaje anterior de forma asíncrona
     prev_id = last_sent_msg_id
     if prev_id:
         threading.Thread(target=delete_previous_telegram_message, args=(chat_id, prev_id), daemon=True).start()
@@ -155,16 +164,16 @@ def send_telegram(chat_id, text):
 def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
     prompt = SYSTEM_PROMPT
     if custom_context:
-        prompt += f"\nContexto especial: {custom_context}"
+        prompt += f"\nContexto especial del usuario: {custom_context}"
     if text_input:
-        prompt += f"\nTexto de la pantalla:\n{text_input}"
+        prompt += f"\nTexto capturado de pantalla:\n{text_input}"
 
     b64_img = None
     if image_bytes:
         hd_bytes, mime_type = prepare_image(image_bytes)
         b64_img = base64.b64encode(hd_bytes).decode("utf-8")
 
-    # 1. OpenAI GPT con razonamiento paso a paso
+    # Modelo insignia: GPT-4o con detail="high" para máxima agudeza visual y precisión
     if OPENAI_API_KEY:
         content_list = [{"type": "text", "text": prompt}]
         if b64_img:
@@ -172,15 +181,15 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                 "type": "image_url",
                 "image_url": {
                     "url": f"data:{mime_type};base64,{b64_img}",
-                    "detail": "auto"
+                    "detail": "high"
                 }
             })
-        for model_name in ["gpt-4.1-mini", "gpt-4o"]:
+        for model_name in ["gpt-4o", "gpt-4.1-mini"]:
             try:
                 payload = {
                     "model": model_name,
                     "messages": [{"role": "user", "content": content_list}],
-                    "max_tokens": 140,
+                    "max_tokens": 180,
                     "temperature": 0.0
                 }
                 req = urllib.request.Request(
@@ -201,7 +210,7 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
             except Exception as e:
                 print(f"[WARN] {model_name}: {e}", flush=True)
 
-    # 2. Respaldo Gemini 3.5 Flash con Thinking
+    # Respaldo Gemini 3.5 Flash con Thinking
     if GEMINI_API_KEY:
         parts = [{"text": prompt}]
         if b64_img:
@@ -213,7 +222,7 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
         }
         try:
             req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with urllib.request.urlopen(req, timeout=14) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             candidates = data.get("candidates", [])
             if candidates:
@@ -244,7 +253,7 @@ def process_ntfy_event(ev):
         att_type = att.get("type", "").lower()
         try:
             req_att = urllib.request.Request(att_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_att, timeout=10) as r_att:
+            with urllib.request.urlopen(req_att, timeout=12) as r_att:
                 content_bytes = r_att.read()
             if len(content_bytes) == 0:
                 return
@@ -348,7 +357,7 @@ def poll_telegram_loop():
                         custom_context = txt[10:].strip()
                         send_telegram(chat_id, f"✅ Contexto: {custom_context}")
                     elif txt.lower() in ("/start", "hola", "/estado", "estado"):
-                        send_telegram(chat_id, "🧠 Modo Alta Precisión Activo")
+                        send_telegram(chat_id, "🧠 Modo GPT-4o Máxima Precisión Activo")
                     else:
                         ans = ask_ai(text_input=txt)
                         send_telegram(chat_id, ans)
