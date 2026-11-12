@@ -51,25 +51,25 @@ CODE_WORDS = {
 }
 
 SYSTEM_PROMPT = (
-    "Eres un evaluador académico de máxima precisión y rigor universitario.\n"
-    "Tu objetivo es identificar con 100% de certeza la respuesta correcta a la pregunta activa de la pantalla.\n\n"
-    "INSTRUCCIONES CLAVE:\n"
-    "1. Si la captura contiene una conversación, chat o historial anterior (por ejemplo Claude, ChatGPT o un examen previo), "
-    "concéntrate EXCLUSIVAMENTE en la ÚLTIMA pregunta de abajo (la pregunta activa).\n"
-    "2. Lee detenidamente el enunciado, cada opción de respuesta, números, signos y detalles conceptuales sin apresurarte.\n"
-    "3. Si requiere cálculo matemático o aplicación de fórmulas (por ejemplo multiplicadores, tasas, porcentajes), haz el cálculo mental paso a paso para no caer en trampas.\n"
-    "4. Identifica con precisión cuál es la opción correcta.\n"
-    "5. Cierra obligatoriamente en una nueva línea con la etiqueta exacta: <R>VALOR</R> siguiendo estas reglas:\n"
-    "   • Si las opciones son letras (a, b, c, d, e): escribe la letra exacta, ej: <R>a</R>, <R>b</R>, <R>c</R>, <R>d</R> o <R>e</R>.\n"
-    "   • Si las opciones NO tienen letra, cuéntalas de ARRIBA hacia ABAJO: 1ra=A, 2da=B, 3ra=C, 4ta=D, 5ta=E.\n"
-    "   • Si es VERDADERO o FALSO: <R>V</R> o <R>F</R>.\n"
-    "   • Si es SÍ o NO: <R>S</R> o <R>N</R>.\n"
-    "   • Si es pregunta abierta u otro tipo: escribe dentro de <R>...</R> ÚNICAMENTE la primera palabra de la respuesta correcta (ej: <R>El</R>)."
+    "Eres un profesor universitario experto en responder cuestionarios y exámenes con 100% de precisión.\n"
+    "Enfócate EXCLUSIVAMENTE en la pregunta activa (la última de abajo si hay historial anterior).\n"
+    "PASOS:\n"
+    "1. Escribe el razonamiento o cálculo en 1 línea.\n"
+    "2. Identifica el valor o concepto exacto.\n"
+    "3. Observa las opciones mostradas abajo del enunciado:\n"
+    "   • Si la pregunta pide responder DOS partes distintas (ej: pregunta A y pregunta B):\n"
+    "     Resuelve ambas y escribe: <R>A: [letra/valor] | B: [letra/valor]</R>.\n"
+    "   • Si es una pregunta de opción única:\n"
+    "     - Si las opciones tienen letras (a, b, c, d, e), usa esa letra exacta, ej: <R>D</R>.\n"
+    "     - Si las opciones NO tienen letras, cuéntalas en orden vertical de arriba a abajo: Fila 1 = A, Fila 2 = B, Fila 3 = C, Fila 4 = D, Fila 5 = E. Pon <R>LETRA</R>.\n"
+    "   • Si es Verdadero/Falso: <R>V</R> o <R>F</R>.\n"
+    "   • Si es Sí/No: <R>S</R> o <R>N</R>.\n"
+    "   • Si es pregunta abierta u otro tipo: escribe dentro de <R>...</R> la primera palabra de la respuesta correcta.\n"
+    "4. Concluye OBLIGATORIAMENTE en la última línea con la etiqueta exacta: <R>VALOR</R>."
 )
 
 
 def prepare_image(image_bytes: bytes):
-    """Conserva la imagen completa con alta resolución (1440px) y compresión limpia."""
     if not HAS_PIL:
         return image_bytes, "image/png"
     try:
@@ -90,18 +90,23 @@ def format_final_output(raw_text: str) -> str:
     if not raw_text:
         return "..."
 
+    # Extraer la etiqueta <R>...</R>
     m = re.search(r"<R>\s*([^<]+?)\s*</R>", raw_text, re.I)
     if m:
         val = m.group(1).strip()
     else:
-        # Extraer si puso letra aislada al final
+        # Fallback si no puso etiqueta
         lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
         val = lines[-1].strip(".,:;() ") if lines else "..."
+
+    # Si es respuesta doble tipo A: ... | B: ...
+    if "|" in val:
+        return val
 
     val_upper = val.upper()
 
     with lock:
-        # Mapeo a palabra clave
+        # Mapeo de una letra sola (A-E) a su palabra clave
         if val_upper in CODE_WORDS:
             words = CODE_WORDS[val_upper]
             word = words[toggle_idx % len(words)]
@@ -173,7 +178,7 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
         hd_bytes, mime_type = prepare_image(image_bytes)
         b64_img = base64.b64encode(hd_bytes).decode("utf-8")
 
-    # Modelo insignia: GPT-4o con detail="high" para máxima agudeza visual y precisión
+    # 1. GPT-4o con detail="high" y max_tokens=180 para garantizar que complete el razonamiento y cierre con <R>
     if OPENAI_API_KEY:
         content_list = [{"type": "text", "text": prompt}]
         if b64_img:
@@ -184,33 +189,32 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                     "detail": "high"
                 }
             })
-        for model_name in ["gpt-4o", "gpt-4.1-mini"]:
-            try:
-                payload = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": content_list}],
-                    "max_tokens": 180,
-                    "temperature": 0.0
+        try:
+            payload = {
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": content_list}],
+                "max_tokens": 180,
+                "temperature": 0.0
+            }
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
                 }
-                req = urllib.request.Request(
-                    "https://api.openai.com/v1/chat/completions",
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json"
-                    }
-                )
-                with urllib.request.urlopen(req, timeout=14) as resp:
-                    r_data = json.loads(resp.read().decode("utf-8"))
-                ans = r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                if ans:
-                    final_out = format_final_output(ans)
-                    print(f"[{model_name} -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
-                    return final_out
-            except Exception as e:
-                print(f"[WARN] {model_name}: {e}", flush=True)
+            )
+            with urllib.request.urlopen(req, timeout=14) as resp:
+                r_data = json.loads(resp.read().decode("utf-8"))
+            ans = r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if ans:
+                final_out = format_final_output(ans)
+                print(f"[gpt-4o -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
+                return final_out
+        except Exception as e:
+            print(f"[WARN] gpt-4o: {e}", flush=True)
 
-    # Respaldo Gemini 3.5 Flash con Thinking
+    # 2. Respaldo Gemini 3.5 Flash con Thinking
     if GEMINI_API_KEY:
         parts = [{"text": prompt}]
         if b64_img:
@@ -357,7 +361,7 @@ def poll_telegram_loop():
                         custom_context = txt[10:].strip()
                         send_telegram(chat_id, f"✅ Contexto: {custom_context}")
                     elif txt.lower() in ("/start", "hola", "/estado", "estado"):
-                        send_telegram(chat_id, "🧠 Modo GPT-4o Máxima Precisión Activo")
+                        send_telegram(chat_id, "🧠 Modo GPT-4o 100% Precisión Activo")
                     else:
                         ans = ask_ai(text_input=txt)
                         send_telegram(chat_id, ans)
