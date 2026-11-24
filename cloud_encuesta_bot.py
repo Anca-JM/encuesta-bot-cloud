@@ -93,8 +93,8 @@ def format_final_output(raw_text: str) -> str:
     if not raw_text:
         return "..."
 
-    # Extraer etiquetas <R>...</R>
-    tags = re.findall(r"<R>\s*([^<]+?)\s*</R>", raw_text, re.I)
+    # Extraer etiquetas <R>...</R> (tolerando si se cortó el '>' final)
+    tags = re.findall(r"<R>\s*([^<]+?)\s*(?:</R>|</R|$)", raw_text, re.I)
     valid_tags = [
         t.strip()
         for t in tags
@@ -115,6 +115,17 @@ def format_final_output(raw_text: str) -> str:
     # Respuesta combinada tipo A: ... | B: ...
     if "|" in val:
         return val
+
+    # Múltiples letras separadas por coma o espacio (ej: "A C D" o "B, D")
+    clean_parts = [p.strip(",.;: ") for p in re.split(r"[\s,]+", val.strip()) if p.strip(",.;: ")]
+    if len(clean_parts) > 1 and all(p.upper() in CODE_WORDS for p in clean_parts):
+        with lock:
+            mapped = []
+            for p in clean_parts:
+                words = CODE_WORDS[p.upper()]
+                mapped.append(words[toggle_idx % len(words)])
+                toggle_idx += 1
+            return " | ".join(mapped)
 
     val_upper = val.upper()
 
@@ -171,19 +182,22 @@ def send_telegram(chat_id, text):
         "chat_id": chat_id,
         "text": text
     }).encode("utf-8")
-    try:
-        req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            res_data = json.loads(resp.read().decode("utf-8"))
-            if res_data.get("ok"):
-                new_id = res_data["result"]["message_id"]
-                with lock:
-                    to_delete = list(previous_msg_ids)
-                    previous_msg_ids = [new_id]
-                if to_delete:
-                    threading.Thread(target=delete_old_messages, args=(chat_id, to_delete), daemon=True).start()
-    except Exception as e:
-        print(f"[WARN] Error enviando Telegram: {e}", flush=True)
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, data=data)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                if res_data.get("ok"):
+                    new_id = res_data["result"]["message_id"]
+                    with lock:
+                        to_delete = list(previous_msg_ids)
+                        previous_msg_ids = [new_id]
+                    if to_delete:
+                        threading.Thread(target=delete_old_messages, args=(chat_id, to_delete), daemon=True).start()
+                    return
+        except Exception as e:
+            print(f"[WARN] Error enviando Telegram (intento {attempt + 1}/3): {e}", flush=True)
+            time.sleep(0.35)
 
 
 def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_type: str = "image/png"):
@@ -200,7 +214,7 @@ def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_t
     payload = {
         "model": model_name,
         "messages": [{"role": "user", "content": content_list}],
-        "max_tokens": 160,
+        "max_tokens": 220,
         "temperature": 0.0
     }
     req = urllib.request.Request(
