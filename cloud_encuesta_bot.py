@@ -3,6 +3,7 @@ import io
 import sys
 import re
 import time
+import datetime
 import json
 import base64
 import threading
@@ -26,6 +27,8 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "jafet_encuesta_903689").strip()
 DEFAULT_CHAT_ID = int(os.environ.get("CHAT_ID", "7835887634").strip())
 GH_PAT = os.environ.get("GH_PAT", "").strip()
 GH_REPO = os.environ.get("GITHUB_REPOSITORY", "Anca-JM/encuesta-bot-cloud").strip()
+GDRIVE_WEBHOOK_URL = os.environ.get("GDRIVE_WEBHOOK_URL", "").strip()
+GDRIVE_SECRET = "jafet_drive_903689"
 
 MAX_RUNTIME_SECONDS = 5 * 3600 + 25 * 60  # 5h 25m
 START_TIME = time.time()
@@ -270,6 +273,47 @@ def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_t
     return r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
 
+def _upload_to_gdrive(answer: str, reasoning: str, b64_img: str = None, mime_type: str = "image/jpeg"):
+    if not GDRIVE_WEBHOOK_URL:
+        return
+    try:
+        now_ec = datetime.datetime.utcnow() - datetime.timedelta(hours=5)
+        safe_ans = re.sub(r"[^A-Za-z0-9áéíóúÁÉÍÓÚñÑ_-]+", "_", answer).strip("_")[:30] or "resp"
+        ext = "jpg" if "jpeg" in (mime_type or "") else "png"
+        filename = f"{now_ec.strftime('%H-%M-%S')}_{safe_ans}.{ext}" if b64_img else ""
+        payload = {
+            "secret": GDRIVE_SECRET,
+            "date": now_ec.strftime("%Y-%m-%d"),
+            "timestamp": now_ec.strftime("%Y-%m-%d %H:%M:%S"),
+            "answer": answer,
+            "reasoning": " ".join((reasoning or "").splitlines())[:500],
+            "filename": filename,
+            "mime": mime_type if b64_img else "",
+            "image_b64": b64_img or ""
+        }
+        req = urllib.request.Request(
+            GDRIVE_WEBHOOK_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Connection": "close"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            res_txt = resp.read().decode("utf-8", errors="replace").strip()
+            if res_txt != "ok":
+                print(f"[WARN] Drive respuesta inesperada: {res_txt[:100]}", flush=True)
+    except Exception as e:
+        print(f"[WARN] Error guardando en Drive: {e}", flush=True)
+
+
+def save_to_gdrive_async(answer: str, reasoning: str, b64_img: str = None, mime_type: str = "image/jpeg"):
+    if not GDRIVE_WEBHOOK_URL:
+        return
+    threading.Thread(
+        target=_upload_to_gdrive,
+        args=(answer, reasoning, b64_img, mime_type),
+        daemon=True
+    ).start()
+
+
 def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
     prompt = SYSTEM_PROMPT
     if custom_context:
@@ -294,6 +338,7 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                 if ans and not is_refusal(ans):
                     final_out = format_final_output(ans)
                     print(f"[{model} -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
+                    save_to_gdrive_async(final_out, ans, b64_img, mime_type)
                     return final_out
                 elif ans:
                     print(f"[WARN] {model} rechazó la imagen, probando respaldo...", flush=True)
