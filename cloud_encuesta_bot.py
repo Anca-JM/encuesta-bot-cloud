@@ -48,28 +48,54 @@ CODE_WORDS = {
     "4": ["Dedo", "Duna"],
     "E": ["Eco", "Eje"],
     "5": ["Eco", "Eje"],
+    "F": ["Faro", "Fuego"],
+    "6": ["Faro", "Fuego"],
+    "G": ["Gato", "Gris"],
+    "7": ["Gato", "Gris"],
+    "H": ["Hilo", "Hoja"],
+    "8": ["Hilo", "Hoja"],
 }
 
 SYSTEM_PROMPT = (
-    "Eres un examinador de élite con precisión analítica y matemática del 100%.\n"
-    "Enfócate EXCLUSIVAMENTE en la pregunta activa (la última de abajo si hay historial anterior de chat).\n"
+    "Eres un profesor universitario experto con precisión analítica y matemática del 100%.\n"
+    "Enfócate EXCLUSIVAMENTE en la pregunta activa (la última de abajo si hay historial anterior).\n"
+    "IGNORA si alguna casilla u opción ya aparece marcada en pantalla; evalúa todas las opciones desde cero.\n"
     "PASOS OBLIGATORIOS:\n"
-    "1. Resuelve paso a paso en 1 o 2 líneas exactas (calcula con rigor sin saltarte pasos ni despejes matemáticos).\n"
-    "2. Determina el resultado exacto.\n"
-    "3. Si hay opciones (en lista vertical O en una línea horizontal separadas por puntos •, comas, guiones o espacios):\n"
-    "   - Mapea las opciones en orden de aparición (de izquierda a derecha o de arriba a abajo):\n"
-    "     1ª opción = A\n"
-    "     2ª opción = B\n"
-    "     3ª opción = C\n"
-    "     4ª opción = D\n"
-    "     5ª opción = E\n"
-    "   - En preguntas de opciones tu resultado final DEBE ser solo la letra: <R>A</R>, <R>B</R>, <R>C</R>, <R>D</R> o <R>E</R>. NUNCA pongas el número ni la palabra de la opción.\n"
-    "4. Si es Verdadero/Falso: <R>V</R> o <R>F</R>.\n"
-    "5. Si es Sí/No: <R>S</R> o <R>N</R>.\n"
-    "6. Si pide dos partes (A y B): <R>A: [letra] | B: [letra]</R>.\n"
-    "7. Si es pregunta abierta sin opciones: escribe solo la primera palabra de la respuesta correcta dentro de <R>...</R>.\n"
-    "8. Concluye en la última línea con: <R>LETRA_O_RESPUESTA</R>."
+    "1. Razona o calcula paso a paso en 1 o 2 líneas MUY breves (NO transcribas el texto largo de las opciones).\n"
+    "2. Si hay opciones (en lista vertical u horizontal separadas por puntos •, comas o espacios):\n"
+    "   - Mapea las opciones en orden de aparición: 1ª=A, 2ª=B, 3ª=C, 4ª=D, 5ª=E, 6ª=F, 7ª=G, 8ª=H.\n"
+    "   - Si es opción única, responde solo la letra: <R>C</R>. NUNCA pongas el texto ni el número de la opción.\n"
+    "   - Si es selección múltiple (casillas cuadradas / pide marcar varias), incluye TODAS las letras correctas separadas por espacio: ej. <R>B F</R> o <R>A C D</R>.\n"
+    "3. Si es Verdadero/Falso: escribe <R>VERDADERO</R> o <R>FALSO</R>.\n"
+    "4. Si es Sí/No: escribe <R>SI</R> o <R>NO</R>.\n"
+    "5. Si pide dos sub-preguntas distintas (A y B): <R>A: [letra] | B: [letra]</R>.\n"
+    "6. Si es pregunta abierta sin opciones: escribe solo la primera palabra clave dentro de <R>...</R>.\n"
+    "7. Cierra OBLIGATORIAMENTE en la última línea con: <R>RESPUESTA</R>."
 )
+
+FALLBACK_PROMPT = (
+    "Analiza la pregunta académica mostrada en la imagen y determina la respuesta correcta.\n"
+    "Mapea las opciones visibles en orden (1ª=A, 2ª=B, 3ª=C, 4ª=D, 5ª=E, 6ª=F, 7ª=G, 8ª=H).\n"
+    "Si hay varias opciones correctas, sepáralas con espacio (ej. <R>B F</R>).\n"
+    "Si es Verdadero/Falso escribe <R>VERDADERO</R> o <R>FALSO</R>. Si es Sí/No escribe <R>SI</R> o <R>NO</R>.\n"
+    "Responde brevemente y termina siempre con la etiqueta <R>RESPUESTA</R>."
+)
+
+REFUSAL_PHRASES = (
+    "lo siento",
+    "no puedo ayudar",
+    "no puedo responder",
+    "no puedo asistir",
+    "i'm sorry",
+    "i cannot assist",
+    "i can't help",
+    "cannot help with",
+)
+
+
+def is_refusal(text: str) -> bool:
+    low = (text or "").lower()
+    return any(p in low for p in REFUSAL_PHRASES)
 
 
 def prepare_image(image_bytes: bytes):
@@ -98,26 +124,30 @@ def format_final_output(raw_text: str) -> str:
     valid_tags = [
         t.strip()
         for t in tags
-        if t.strip().upper() not in ("VALOR", "RESULTADO", "LETRA_O_RESPUESTA", "ANSWER", "")
+        if t.strip().upper() not in ("VALOR", "RESULTADO", "RESPUESTA", "LETRA_O_RESPUESTA", "ANSWER", "")
     ]
 
     if valid_tags:
         val = valid_tags[0]
     else:
-        # Fallback: buscar letra A-E aislada al final
-        m = re.search(r"\b([A-E])\b[^\w]*$", raw_text.strip(), re.I)
+        # Fallback: buscar letra A-H aislada al final
+        m = re.search(r"\b([A-H])\b[^\w]*$", raw_text.strip(), re.I)
         if m:
             val = m.group(1)
         else:
             lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
             val = lines[-1].strip(".,:;() ") if lines else "..."
 
-    # Respuesta combinada tipo A: ... | B: ...
-    if "|" in val:
+    # Respuesta combinada con dos sub-preguntas tipo "A: C | B: D"
+    if "|" in val and ":" in val:
         return val
 
-    # Múltiples letras separadas por coma o espacio (ej: "A C D" o "B, D")
-    clean_parts = [p.strip(",.;: ") for p in re.split(r"[\s,]+", val.strip()) if p.strip(",.;: ")]
+    # Múltiples letras separadas por coma, espacio, barra o "y" (ej: "A C D", "B, F", "B | F", "C y G")
+    clean_parts = [
+        p.strip(",.;:() ")
+        for p in re.split(r"[\s,|]+|\by\b", val.strip(), flags=re.I)
+        if p.strip(",.;:() ")
+    ]
     if len(clean_parts) > 1 and all(p.upper() in CODE_WORDS for p in clean_parts):
         with lock:
             mapped = []
@@ -127,24 +157,26 @@ def format_final_output(raw_text: str) -> str:
                 toggle_idx += 1
             return " | ".join(mapped)
 
-    val_upper = val.upper()
+    val_upper = val.strip(".,:;() ").upper()
 
     with lock:
-        # Mapeo de letra a palabra clave (A->Árbol/Ámbar, B->Barco/Bosque, C->Casa/Cielo, D->Dedo/Duna, E->Eco/Eje)
-        if val_upper in CODE_WORDS:
-            words = CODE_WORDS[val_upper]
-            word = words[toggle_idx % len(words)]
-            toggle_idx += 1
-            return word
-
         if val_upper in ("V", "VERDADERO", "TRUE"):
             return "V"
-        if val_upper in ("F", "FALSO", "FALSE"):
+        if val_upper in ("FALSO", "FALSE"):
+            return "F"
+        if val_upper == "F" and re.search(r"\b(falso|verdadero|false|true)\b", raw_text, re.I):
             return "F"
         if val_upper in ("S", "SI", "SÍ", "YES"):
             return "S"
         if val_upper in ("N", "NO"):
             return "N"
+
+        # Mapeo de letra a palabra clave (A->Árbol/Ámbar ... H->Hilo/Hoja)
+        if val_upper in CODE_WORDS:
+            words = CODE_WORDS[val_upper]
+            word = words[toggle_idx % len(words)]
+            toggle_idx += 1
+            return word
 
         # Pregunta abierta: primera palabra
         first_word = val.split()[0] if val.split() else val
@@ -182,10 +214,10 @@ def send_telegram(chat_id, text):
         "chat_id": chat_id,
         "text": text
     }).encode("utf-8")
-    for attempt in range(3):
+    for attempt in range(4):
         try:
-            req = urllib.request.Request(url, data=data)
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            req = urllib.request.Request(url, data=data, headers={"Connection": "close"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
                 if res_data.get("ok"):
                     new_id = res_data["result"]["message_id"]
@@ -196,8 +228,8 @@ def send_telegram(chat_id, text):
                         threading.Thread(target=delete_old_messages, args=(chat_id, to_delete), daemon=True).start()
                     return
         except Exception as e:
-            print(f"[WARN] Error enviando Telegram (intento {attempt + 1}/3): {e}", flush=True)
-            time.sleep(0.35)
+            print(f"[WARN] Error enviando Telegram (intento {attempt + 1}/4): {e}", flush=True)
+            time.sleep(0.35 * (attempt + 1))
 
 
 def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_type: str = "image/png"):
@@ -242,15 +274,21 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
         hd_bytes, mime_type = prepare_image(image_bytes)
         b64_img = base64.b64encode(hd_bytes).decode("utf-8")
 
-    # 1. GPT-4.1 (Modelo principal de máxima inteligencia y velocidad)
+    # 1. GPT-4.1 principal + respaldo automático si hay rechazo o error
     if OPENAI_API_KEY:
-        for model in ("gpt-4.1", "gpt-4o"):
+        attempts = [
+            ("gpt-4.1", prompt),
+            ("gpt-4o", FALLBACK_PROMPT + (f"\nContexto: {custom_context}" if custom_context else "") + (f"\nTexto:\n{text_input}" if text_input else "")),
+        ]
+        for model, used_prompt in attempts:
             try:
-                ans = call_openai_vision(model, prompt, b64_img, mime_type)
-                if ans:
+                ans = call_openai_vision(model, used_prompt, b64_img, mime_type)
+                if ans and not is_refusal(ans):
                     final_out = format_final_output(ans)
                     print(f"[{model} -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
                     return final_out
+                elif ans:
+                    print(f"[WARN] {model} rechazó la imagen, probando respaldo...", flush=True)
             except Exception as e:
                 print(f"[WARN] {model} fallo: {e}", flush=True)
 
