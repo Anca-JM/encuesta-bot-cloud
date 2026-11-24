@@ -70,6 +70,7 @@ SYSTEM_PROMPT = (
     "   • ORDENAR PASOS O SECUENCIAS: responde el orden exacto de los ítems visibles usando '>': ej. <R>3 > 1 > 4 > 2</R> o <R>C > A > B</R>.\n"
     "   • VERDADERO / FALSO: escribe <R>VERDADERO</R> o <R>FALSO</R>.\n"
     "   • SÍ / NO: escribe <R>SI</R> o <R>NO</R>.\n"
+    "   • CUALQUIER OTRA PREGUNTA SORPRESA O DIFERENTE (asiento contable, fórmula, definir, tabla, completar frase): responde de forma directa y entendible en 1 sola línea corta (sin relleno, máx. 8-10 palabras): ej. <R>Debe: Caja 500 / Haber: Capital 500</R>.\n"
     "3. Cierra OBLIGATORIAMENTE en la última línea con: <R>RESPUESTA</R>."
 )
 
@@ -79,6 +80,7 @@ FALLBACK_PROMPT = (
     "- Si las opciones NO son visibles (desplegable cerrado o completar): NO inventes letras; pon el número exacto o la palabra clave (1-2 palabras).\n"
     "- Si hay varios emparejamientos o espacios: <R>1: valor | 2: valor</R>. Si es ordenar: <R>3 > 1 > 2</R>.\n"
     "- Si es Verdadero/Falso: <R>VERDADERO</R> o <R>FALSO</R>. Si es Sí/No: <R>SI</R> o <R>NO</R>.\n"
+    "- Para cualquier otro formato sorpresa: responde claro y directo en 1 línea corta (máx. 10 palabras).\n"
     "Termina siempre con la etiqueta <R>RESPUESTA</R>."
 )
 
@@ -179,13 +181,14 @@ def format_final_output(raw_text: str) -> str:
             toggle_idx += 1
             return word
 
-        # Pregunta abierta / desplegable cerrado / completar: devolver hasta 2 palabras clave limpias
-        words = val.strip(".,:;() ").split()
-        if not words:
-            return val
-        if len(words) == 1:
-            return words[0]
-        return " ".join(words[:2])
+        # Pregunta abierta / desplegable cerrado / formato sorpresa: 1 línea limpia, corta y entendible
+        clean_val = " ".join(val.strip(".,:;() ").split())
+        if not clean_val:
+            return "..."
+        words = clean_val.split()
+        if len(words) > 12:
+            clean_val = " ".join(words[:12])
+        return clean_val[:110]
 
 
 def delete_single_message(chat_id, message_id):
