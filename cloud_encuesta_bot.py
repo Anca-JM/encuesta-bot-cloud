@@ -74,7 +74,21 @@ SYSTEM_PROMPT = (
     "   • VERDADERO / FALSO: escribe <R>VERDADERO</R> o <R>FALSO</R>.\n"
     "   • SÍ / NO: escribe <R>SI</R> o <R>NO</R>.\n"
     "   • CUALQUIER OTRA PREGUNTA SORPRESA O DIFERENTE (asiento contable, fórmula, definir, tabla, completar frase): responde de forma directa y entendible en 1 sola línea corta (sin relleno, máx. 8-10 palabras): ej. <R>Debe: Caja 500 / Haber: Capital 500</R>.\n"
-    "3. Cierra OBLIGATORIAMENTE en la última línea con: <R>RESPUESTA</R>."
+    "3. Si la pregunta es muy compleja, tiene trampa, es ambigua o tienes menos del 90% de seguridad, NO adivines: responde únicamente <R>ESCALAR</R>.\n"
+    "4. De lo contrario, cierra OBLIGATORIAMENTE en la última línea con: <R>RESPUESTA</R>."
+)
+
+ADVANCED_PROMPT = (
+    "Eres un catedrático experto de máximo nivel. Resuelve con rigor absoluto esta pregunta difícil.\n"
+    "Enfócate EXCLUSIVAMENTE en la pregunta activa (la última de abajo) e IGNORA cualquier opción ya marcada.\n"
+    "Aplica el formato exacto al final:\n"
+    "- Opción única visible (1ª=A .. 8ª=H): solo la letra <R>C</R>.\n"
+    "- Selección múltiple visible (varias correctas): letras separadas por espacio <R>B F</R> o <R>A C D</R>.\n"
+    "- Desplegable cerrado / sin opciones visibles: número exacto o palabra clave (1-2 palabras).\n"
+    "- Emparejar / varios espacios: <R>1: valor | 2: valor</R>. Ordenar: <R>3 > 1 > 2</R>.\n"
+    "- Verdadero/Falso: <R>VERDADERO</R> o <R>FALSO</R>. Sí/No: <R>SI</R> o <R>NO</R>.\n"
+    "- Otro formato sorpresa: 1 sola línea corta y clara (máx. 10 palabras).\n"
+    "Analiza con total precisión y cierra OBLIGATORIAMENTE en la última línea con: <R>RESPUESTA</R>."
 )
 
 FALLBACK_PROMPT = (
@@ -243,7 +257,7 @@ def send_telegram(chat_id, text):
             time.sleep(0.35 * (attempt + 1))
 
 
-def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_type: str = "image/png"):
+def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_type: str = "image/png", is_reasoning: bool = False):
     content_list = [{"type": "text", "text": prompt}]
     if b64_img:
         content_list.append({
@@ -254,12 +268,23 @@ def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_t
             }
         })
 
-    payload = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": content_list}],
-        "max_tokens": 220,
-        "temperature": 0.0
-    }
+    if is_reasoning:
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": content_list}],
+            "max_completion_tokens": 900,
+            "reasoning_effort": "low"
+        }
+        timeout_s = 25
+    else:
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": content_list}],
+            "max_tokens": 220,
+            "temperature": 0.0
+        }
+        timeout_s = 14
+
     req = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -268,9 +293,9 @@ def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_t
             "Content-Type": "application/json"
         }
     )
-    with urllib.request.urlopen(req, timeout=14) as resp:
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         r_data = json.loads(resp.read().decode("utf-8"))
-    return r_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    return (r_data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
 
 
 def _upload_to_gdrive(answer: str, reasoning: str, b64_img: str = None, mime_type: str = "image/jpeg"):
@@ -315,35 +340,60 @@ def save_to_gdrive_async(answer: str, reasoning: str, b64_img: str = None, mime_
 
 
 def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
-    prompt = SYSTEM_PROMPT
+    extra_ctx = ""
     if custom_context:
-        prompt += f"\nContexto especial del usuario: {custom_context}"
+        extra_ctx += f"\nContexto especial del usuario: {custom_context}"
     if text_input:
-        prompt += f"\nTexto capturado de pantalla:\n{text_input}"
+        extra_ctx += f"\nTexto capturado de pantalla:\n{text_input}"
 
     b64_img = None
     if image_bytes:
         hd_bytes, mime_type = prepare_image(image_bytes)
         b64_img = base64.b64encode(hd_bytes).decode("utf-8")
 
-    # 1. GPT-4.1 principal + respaldo automático si hay rechazo o error
     if OPENAI_API_KEY:
-        attempts = [
-            ("gpt-4.1", prompt),
-            ("gpt-4o", FALLBACK_PROMPT + (f"\nContexto: {custom_context}" if custom_context else "") + (f"\nTexto:\n{text_input}" if text_input else "")),
-        ]
-        for model, used_prompt in attempts:
-            try:
-                ans = call_openai_vision(model, used_prompt, b64_img, mime_type)
-                if ans and not is_refusal(ans):
+        # Nivel 1: GPT-4.1 (rápido y económico para ~95% de preguntas)
+        escalate_reason = None
+        try:
+            ans = call_openai_vision("gpt-4.1", SYSTEM_PROMPT + extra_ctx, b64_img, mime_type, is_reasoning=False)
+            if ans and not is_refusal(ans):
+                if re.search(r"<R>\s*ESCALAR\s*(?:</R>|</R|$)", ans, re.I):
+                    escalate_reason = "duda de gpt-4.1"
+                else:
                     final_out = format_final_output(ans)
-                    print(f"[{model} -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
-                    save_to_gdrive_async(final_out, ans, b64_img, mime_type)
-                    return final_out
-                elif ans:
-                    print(f"[WARN] {model} rechazó la imagen, probando respaldo...", flush=True)
-            except Exception as e:
-                print(f"[WARN] {model} fallo: {e}", flush=True)
+                    if final_out and final_out != "...":
+                        print(f"[gpt-4.1 -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
+                        save_to_gdrive_async(final_out, ans, b64_img, mime_type)
+                        return final_out
+                    escalate_reason = "respuesta vacía"
+            else:
+                escalate_reason = "rechazo o vacío"
+        except Exception as e:
+            escalate_reason = f"error: {e}"
+
+        print(f"[ESCALANDO -> gpt-5.4] Motivo: {escalate_reason}", flush=True)
+
+        # Nivel 2: GPT-5.4 (IA avanzada con razonamiento profundo solo en casos difíciles)
+        try:
+            ans_adv = call_openai_vision("gpt-5.4", ADVANCED_PROMPT + extra_ctx, b64_img, mime_type, is_reasoning=True)
+            if ans_adv and not is_refusal(ans_adv):
+                final_out = format_final_output(ans_adv)
+                print(f"[gpt-5.4 -> {final_out}] {ans_adv.replace(chr(10), ' ')}", flush=True)
+                save_to_gdrive_async(final_out, f"[GPT-5.4] {ans_adv}", b64_img, mime_type)
+                return final_out
+        except Exception as e:
+            print(f"[WARN] gpt-5.4 fallo: {e}", flush=True)
+
+        # Nivel 3: Respaldo de emergencia gpt-4o
+        try:
+            ans_fb = call_openai_vision("gpt-4o", FALLBACK_PROMPT + extra_ctx, b64_img, mime_type, is_reasoning=False)
+            if ans_fb and not is_refusal(ans_fb):
+                final_out = format_final_output(ans_fb)
+                print(f"[gpt-4o -> {final_out}] {ans_fb.replace(chr(10), ' ')}", flush=True)
+                save_to_gdrive_async(final_out, f"[GPT-4o] {ans_fb}", b64_img, mime_type)
+                return final_out
+        except Exception as e:
+            print(f"[WARN] gpt-4o fallo: {e}", flush=True)
 
     return "..."
 
