@@ -59,26 +59,27 @@ CODE_WORDS = {
 SYSTEM_PROMPT = (
     "Eres un profesor universitario experto con precisión analítica y matemática del 100%.\n"
     "Enfócate EXCLUSIVAMENTE en la pregunta activa (la última de abajo si hay historial anterior).\n"
-    "IGNORA si alguna casilla u opción ya aparece marcada en pantalla; evalúa todas las opciones desde cero.\n"
+    "IGNORA si alguna casilla u opción ya aparece marcada en pantalla; evalúa todo desde cero.\n"
     "PASOS OBLIGATORIOS:\n"
-    "1. Razona o calcula paso a paso en 1 o 2 líneas MUY breves (NO transcribas el texto largo de las opciones).\n"
-    "2. Si hay opciones (en lista vertical u horizontal separadas por puntos •, comas o espacios):\n"
-    "   - Mapea las opciones en orden de aparición: 1ª=A, 2ª=B, 3ª=C, 4ª=D, 5ª=E, 6ª=F, 7ª=G, 8ª=H.\n"
-    "   - Si es opción única, responde solo la letra: <R>C</R>. NUNCA pongas el texto ni el número de la opción.\n"
-    "   - Si es selección múltiple (casillas cuadradas / pide marcar varias), incluye TODAS las letras correctas separadas por espacio: ej. <R>B F</R> o <R>A C D</R>.\n"
-    "3. Si es Verdadero/Falso: escribe <R>VERDADERO</R> o <R>FALSO</R>.\n"
-    "4. Si es Sí/No: escribe <R>SI</R> o <R>NO</R>.\n"
-    "5. Si pide dos sub-preguntas distintas (A y B): <R>A: [letra] | B: [letra]</R>.\n"
-    "6. Si es pregunta abierta sin opciones: escribe solo la primera palabra clave dentro de <R>...</R>.\n"
-    "7. Cierra OBLIGATORIAMENTE en la última línea con: <R>RESPUESTA</R>."
+    "1. Razona o calcula paso a paso en 1 o 2 líneas MUY breves (NO transcribas textos largos de opciones).\n"
+    "2. Identifica el tipo de pregunta y aplica la regla exacta:\n"
+    "   • OPCIÓN ÚNICA VISIBLE (vertical u horizontal con •, comas o espacios): mapea en orden 1ª=A, 2ª=B, 3ª=C, 4ª=D, 5ª=E, 6ª=F, 7ª=G, 8ª=H. Responde SOLO la letra: <R>C</R>. NUNCA pongas el texto ni el número de la opción.\n"
+    "   • SELECCIÓN MÚLTIPLE VISIBLE (casillas cuadradas / varias correctas): escribe TODAS las letras correctas separadas por espacio: ej. <R>B F</R> o <R>A C D</R>.\n"
+    "   • DESPLEGABLE CERRADO ('Elegir...' / opciones NO visibles en pantalla) o COMPLETAR UN ESPACIO / CÁLCULO SIN OPCIONES: NO inventes letras; escribe el valor numérico exacto o la palabra clave más distintiva (sin artículos El/La/Un, 1-2 palabras): ej. <R>Pasivo</R> o <R>1200</R>.\n"
+    "   • EMPAREJAR / VARIOS DESPLEGABLES / VARIOS ESPACIOS / SUB-PREGUNTAS: responde en una línea: <R>1: [valor] | 2: [valor] | 3: [valor]</R>.\n"
+    "   • ORDENAR PASOS O SECUENCIAS: responde el orden exacto de los ítems visibles usando '>': ej. <R>3 > 1 > 4 > 2</R> o <R>C > A > B</R>.\n"
+    "   • VERDADERO / FALSO: escribe <R>VERDADERO</R> o <R>FALSO</R>.\n"
+    "   • SÍ / NO: escribe <R>SI</R> o <R>NO</R>.\n"
+    "3. Cierra OBLIGATORIAMENTE en la última línea con: <R>RESPUESTA</R>."
 )
 
 FALLBACK_PROMPT = (
-    "Analiza la pregunta académica mostrada en la imagen y determina la respuesta correcta.\n"
-    "Mapea las opciones visibles en orden (1ª=A, 2ª=B, 3ª=C, 4ª=D, 5ª=E, 6ª=F, 7ª=G, 8ª=H).\n"
-    "Si hay varias opciones correctas, sepáralas con espacio (ej. <R>B F</R>).\n"
-    "Si es Verdadero/Falso escribe <R>VERDADERO</R> o <R>FALSO</R>. Si es Sí/No escribe <R>SI</R> o <R>NO</R>.\n"
-    "Responde brevemente y termina siempre con la etiqueta <R>RESPUESTA</R>."
+    "Resuelve el ejercicio académico mostrado en la imagen con 100% de precisión.\n"
+    "- Si hay opciones visibles en orden (1ª=A .. 8ª=H): pon solo la letra (<R>C</R>) o varias separadas por espacio (<R>B F</R>).\n"
+    "- Si las opciones NO son visibles (desplegable cerrado o completar): NO inventes letras; pon el número exacto o la palabra clave (1-2 palabras).\n"
+    "- Si hay varios emparejamientos o espacios: <R>1: valor | 2: valor</R>. Si es ordenar: <R>3 > 1 > 2</R>.\n"
+    "- Si es Verdadero/Falso: <R>VERDADERO</R> o <R>FALSO</R>. Si es Sí/No: <R>SI</R> o <R>NO</R>.\n"
+    "Termina siempre con la etiqueta <R>RESPUESTA</R>."
 )
 
 REFUSAL_PHRASES = (
@@ -138,8 +139,8 @@ def format_final_output(raw_text: str) -> str:
             lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
             val = lines[-1].strip(".,:;() ") if lines else "..."
 
-    # Respuesta combinada con dos sub-preguntas tipo "A: C | B: D"
-    if "|" in val and ":" in val:
+    # Respuesta combinada (emparejar / múltiples desplegables / sub-preguntas) o secuencia ordenada
+    if ("|" in val and ":" in val) or ">" in val or "→" in val:
         return val
 
     # Múltiples letras separadas por coma, espacio, barra o "y" (ej: "A C D", "B, F", "B | F", "C y G")
@@ -178,9 +179,13 @@ def format_final_output(raw_text: str) -> str:
             toggle_idx += 1
             return word
 
-        # Pregunta abierta: primera palabra
-        first_word = val.split()[0] if val.split() else val
-        return first_word
+        # Pregunta abierta / desplegable cerrado / completar: devolver hasta 2 palabras clave limpias
+        words = val.strip(".,:;() ").split()
+        if not words:
+            return val
+        if len(words) == 1:
+            return words[0]
+        return " ".join(words[:2])
 
 
 def delete_single_message(chat_id, message_id):
