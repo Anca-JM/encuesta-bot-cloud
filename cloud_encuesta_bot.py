@@ -257,16 +257,17 @@ def send_telegram(chat_id, text):
             time.sleep(0.35 * (attempt + 1))
 
 
-def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_type: str = "image/png", is_reasoning: bool = False):
+def call_openai_vision(model_name: str, prompt: str, images_list: list = None, is_reasoning: bool = False):
     content_list = [{"type": "text", "text": prompt}]
-    if b64_img:
-        content_list.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:{mime_type};base64,{b64_img}",
-                "detail": "high"
-            }
-        })
+    if images_list:
+        for b64_img, mime_type in images_list:
+            content_list.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{b64_img}",
+                    "detail": "high"
+                }
+            })
 
     if is_reasoning:
         payload = {
@@ -298,14 +299,19 @@ def call_openai_vision(model_name: str, prompt: str, b64_img: str = None, mime_t
     return (r_data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
 
 
-def _upload_to_gdrive(answer: str, reasoning: str, b64_img: str = None, mime_type: str = "image/jpeg"):
+def _upload_to_gdrive(answer: str, reasoning: str, images_list: list = None):
     if not GDRIVE_WEBHOOK_URL:
         return
     try:
         now_ec = datetime.datetime.utcnow() - datetime.timedelta(hours=5)
         safe_ans = re.sub(r"[^A-Za-z0-9áéíóúÁÉÍÓÚñÑ_-]+", "_", answer).strip("_")[:30] or "resp"
+        
+        # Si hay varias imágenes, subimos la primera o cada una
+        b64_img = images_list[0][0] if (images_list and len(images_list) > 0) else ""
+        mime_type = images_list[0][1] if (images_list and len(images_list) > 0) else "image/jpeg"
         ext = "jpg" if "jpeg" in (mime_type or "") else "png"
         filename = f"{now_ec.strftime('%H-%M-%S')}_{safe_ans}.{ext}" if b64_img else ""
+
         payload = {
             "secret": GDRIVE_SECRET,
             "date": now_ec.strftime("%Y-%m-%d"),
@@ -325,37 +331,68 @@ def _upload_to_gdrive(answer: str, reasoning: str, b64_img: str = None, mime_typ
             res_txt = resp.read().decode("utf-8", errors="replace").strip()
             if res_txt != "ok":
                 print(f"[WARN] Drive respuesta inesperada: {res_txt[:100]}", flush=True)
+
+        # Si había una 2ª imagen (scroll abajo), la guardamos también
+        if images_list and len(images_list) > 1:
+            for idx, (b64_2, mime_2) in enumerate(images_list[1:], start=2):
+                ext2 = "jpg" if "jpeg" in (mime_2 or "") else "png"
+                fn2 = f"{now_ec.strftime('%H-%M-%S')}_{safe_ans}_parte{idx}.{ext2}"
+                p2 = {
+                    "secret": GDRIVE_SECRET,
+                    "date": now_ec.strftime("%Y-%m-%d"),
+                    "timestamp": now_ec.strftime("%Y-%m-%d %H:%M:%S"),
+                    "answer": f"{answer} (parte {idx})",
+                    "reasoning": "Captura continua (scroll)",
+                    "filename": fn2,
+                    "mime": mime_2,
+                    "image_b64": b64_2
+                }
+                r2 = urllib.request.Request(GDRIVE_WEBHOOK_URL, data=json.dumps(p2).encode("utf-8"), headers={"Content-Type": "application/json", "Connection": "close"})
+                try:
+                    with urllib.request.urlopen(r2, timeout=20) as resp2:
+                        resp2.read()
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[WARN] Error guardando en Drive: {e}", flush=True)
 
 
-def save_to_gdrive_async(answer: str, reasoning: str, b64_img: str = None, mime_type: str = "image/jpeg"):
+def save_to_gdrive_async(answer: str, reasoning: str, images_list: list = None):
     if not GDRIVE_WEBHOOK_URL:
         return
     threading.Thread(
         target=_upload_to_gdrive,
-        args=(answer, reasoning, b64_img, mime_type),
+        args=(answer, reasoning, images_list),
         daemon=True
     ).start()
 
 
-def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
+def ask_ai(text_input=None, image_bytes=None, mime_type="image/png", images_batch=None):
     extra_ctx = ""
     if custom_context:
         extra_ctx += f"\nContexto especial del usuario: {custom_context}"
     if text_input:
         extra_ctx += f"\nTexto capturado de pantalla:\n{text_input}"
 
-    b64_img = None
-    if image_bytes:
+    images_list = []
+    if images_batch:
+        for ib, mt in images_batch:
+            hd_bytes, hd_mime = prepare_image(ib)
+            b64_item = base64.b64encode(hd_bytes).decode("utf-8")
+            images_list.append((b64_item, hd_mime))
+    elif image_bytes:
         hd_bytes, mime_type = prepare_image(image_bytes)
         b64_img = base64.b64encode(hd_bytes).decode("utf-8")
+        images_list.append((b64_img, mime_type))
+
+    if len(images_list) > 1:
+        extra_ctx += f"\nNOTA IMPORTANTE: Se adjuntan {len(images_list)} capturas continuas de la misma pantalla (scroll vertical). Analízalas conjuntamente como un solo examen: el enunciado puede estar en la primera imagen y las opciones en la siguiente."
 
     if OPENAI_API_KEY:
         # Nivel 1: GPT-4.1 (rápido y económico para ~95% de preguntas)
         escalate_reason = None
         try:
-            ans = call_openai_vision("gpt-4.1", SYSTEM_PROMPT + extra_ctx, b64_img, mime_type, is_reasoning=False)
+            ans = call_openai_vision("gpt-4.1", SYSTEM_PROMPT + extra_ctx, images_list, is_reasoning=False)
             if ans and not is_refusal(ans):
                 if re.search(r"<R>\s*ESCALAR\s*(?:</R>|</R|$)", ans, re.I):
                     escalate_reason = "duda de gpt-4.1"
@@ -363,7 +400,7 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
                     final_out = format_final_output(ans)
                     if final_out and final_out != "...":
                         print(f"[gpt-4.1 -> {final_out}] {ans.replace(chr(10), ' ')}", flush=True)
-                        save_to_gdrive_async(final_out, ans, b64_img, mime_type)
+                        save_to_gdrive_async(final_out, ans, images_list)
                         return final_out
                     escalate_reason = "respuesta vacía"
             else:
@@ -375,27 +412,73 @@ def ask_ai(text_input=None, image_bytes=None, mime_type="image/png"):
 
         # Nivel 2: GPT-5.4 (IA avanzada con razonamiento profundo solo en casos difíciles)
         try:
-            ans_adv = call_openai_vision("gpt-5.4", ADVANCED_PROMPT + extra_ctx, b64_img, mime_type, is_reasoning=True)
+            ans_adv = call_openai_vision("gpt-5.4", ADVANCED_PROMPT + extra_ctx, images_list, is_reasoning=True)
             if ans_adv and not is_refusal(ans_adv):
                 final_out = format_final_output(ans_adv)
                 print(f"[gpt-5.4 -> {final_out}] {ans_adv.replace(chr(10), ' ')}", flush=True)
-                save_to_gdrive_async(final_out, f"[GPT-5.4] {ans_adv}", b64_img, mime_type)
+                save_to_gdrive_async(final_out, f"[GPT-5.4] {ans_adv}", images_list)
                 return final_out
         except Exception as e:
             print(f"[WARN] gpt-5.4 fallo: {e}", flush=True)
 
         # Nivel 3: Respaldo de emergencia gpt-4o
         try:
-            ans_fb = call_openai_vision("gpt-4o", FALLBACK_PROMPT + extra_ctx, b64_img, mime_type, is_reasoning=False)
+            ans_fb = call_openai_vision("gpt-4o", FALLBACK_PROMPT + extra_ctx, images_list, is_reasoning=False)
             if ans_fb and not is_refusal(ans_fb):
                 final_out = format_final_output(ans_fb)
                 print(f"[gpt-4o -> {final_out}] {ans_fb.replace(chr(10), ' ')}", flush=True)
-                save_to_gdrive_async(final_out, f"[GPT-4o] {ans_fb}", b64_img, mime_type)
+                save_to_gdrive_async(final_out, f"[GPT-4o] {ans_fb}", images_list)
                 return final_out
         except Exception as e:
             print(f"[WARN] gpt-4o fallo: {e}", flush=True)
 
     return "..."
+
+
+BURST_WINDOW_SECONDS = 3.5
+pending_attachments = []
+pending_timer = None
+batch_lock = threading.Lock()
+
+
+def flush_pending_batch():
+    global pending_attachments, pending_timer
+    with batch_lock:
+        batch = list(pending_attachments)
+        pending_attachments = []
+        pending_timer = None
+
+    if not batch:
+        return
+
+    t0 = time.time()
+    try:
+        if len(batch) == 1 and batch[0][1] == "text":
+            ans = ask_ai(text_input=batch[0][0])
+            send_telegram(DEFAULT_CHAT_ID, ans)
+            print(f"[RESUELTO OK] Respondido texto ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+        else:
+            # Lote de imágenes (1 o varias capturas continuas)
+            img_batch = [(b, m) for (b, m) in batch if m != "text"]
+            if not img_batch:
+                return
+            count = len(img_batch)
+            ans = ask_ai(images_batch=img_batch)
+            send_telegram(DEFAULT_CHAT_ID, ans)
+            print(f"[RESUELTO OK] Respondido lote de {count} captura(s) ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+    except Exception as e:
+        print(f"[ERR] Procesando lote: {e}", flush=True)
+
+
+def queue_attachment_for_processing(data_bytes, mime_type):
+    global pending_attachments, pending_timer
+    with batch_lock:
+        pending_attachments.append((data_bytes, mime_type))
+        if pending_timer:
+            pending_timer.cancel()
+        pending_timer = threading.Timer(BURST_WINDOW_SECONDS, flush_pending_batch)
+        pending_timer.daemon = True
+        pending_timer.start()
 
 
 def process_ntfy_event(ev):
@@ -407,7 +490,6 @@ def process_ntfy_event(ev):
             return
         seen_ntfy_ids.add(ev_id)
 
-    t0 = time.time()
     if "attachment" in ev and ev["attachment"].get("url"):
         att = ev["attachment"]
         att_url = att["url"]
@@ -421,21 +503,17 @@ def process_ntfy_event(ev):
                 return
             if att_name.endswith(".txt") or att_type.startswith("text/"):
                 txt = content_bytes.decode("utf-8", errors="replace")
-                ans = ask_ai(text_input=txt)
+                queue_attachment_for_processing(txt, "text")
             else:
                 mime = "image/jpeg" if (att_name.endswith(".jpg") or att_name.endswith(".jpeg") or "jpeg" in att_type) else "image/png"
-                ans = ask_ai(image_bytes=content_bytes, mime_type=mime)
-            send_telegram(DEFAULT_CHAT_ID, ans)
-            print(f"[RESUELTO OK] Respondido ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+                queue_attachment_for_processing(content_bytes, mime)
         except Exception as e:
-            print(f"[ERR] Procesando attachment ntfy: {e}", flush=True)
+            print(f"[ERR] Descargando attachment ntfy: {e}", flush=True)
     else:
         msg_text = (ev.get("message") or "").strip()
         if not msg_text or msg_text == "triggered":
             return
-        ans = ask_ai(text_input=msg_text)
-        send_telegram(DEFAULT_CHAT_ID, ans)
-        print(f"[RESUELTO OK] Respondido texto ({ans}) en {round(time.time() - t0, 2)}s", flush=True)
+        queue_attachment_for_processing(msg_text, "text")
 
 
 def init_ntfy_history():
